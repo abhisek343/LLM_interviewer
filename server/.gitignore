@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment variables
+.env
+
+# Logs
+*.log
+*.logs
+
+# MongoDB
+data/ 
+
+uploads/resumes/*
+!uploads/resumes/.gitkeep
+
+docker-compose.yml
+docker-compose.override.yml
+docker-compose*.yml
+
+api_postman.txt
+
+Readme.md
+# Ignore pytest cache
+.pytest_cache/
+pyvenv.cfg
+
+.venv/Scripts
