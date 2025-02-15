@@ -1,0 +1,107 @@
+# --- Core Framework ---
+fastapi>=0.111.1,<0.112.0
+uvicorn[standard]>=0.30.6,<0.31.0 # Includes websockets, httptools
+
+# --- Pydantic & Settings ---
+pydantic>=2.11.3,<3.0.0
+pydantic-settings>=2.9.1,<3.0.0
+python-dotenv>=1.0.0,<2.0.0 # If used outside pydantic-settings
+
+# --- Database ---
+motor>=3.7.0,<4.0.0
+pymongo>=4.0.0,<5.0.0 # More flexible pymongo version
+
+# --- Authentication & Security ---
+python-jose[cryptography]>=3.4.0,<4.0.0
+passlib[bcrypt]>=1.7.4,<1.8 # Specifies bcrypt extra, manages bcrypt version
+
+# --- LLM Integration ---
+google-generativeai>=0.5.4,<0.6.0
+
+# --- Resume Parsing ---
+pypdf>=3.0.0,<5.0.0 # Replaced PyPDF2
+python-docx>=1.1.2,<2.0.0
+
+# --- ADDED for NLP/Date Handling ---
+spacy>=3.0.0,<4.0.0
+python-dateutil>=2.8.0,<3.0.0
+# NOTE: After installing spacy, download a model, e.g.:
+# python -m spacy download en_core_web_sm (small)
+# python -m spacy download en_core_web_md (medium)
+# python -m spacy download en_core_web_lg (large - recommended for NER)
+# --- END ADDED ---
+
+# --- Form Parsing ---
+python-multipart>=0.0.9,<0.0.10
+
+# --- Other Common Dependencies ---
+email-validator>=2.0.0 # Often needed by pydantic's EmailStr
+aiofiles>=24.1.0 # For async file operations
+
+# --- Additional Packages ---
+aiofiles==24.1.0
+annotated-types==0.7.0
+anyio==4.9.0
+bcrypt==4.3.0
+blis==1.3.0
+cachetools==5.5.2
+catalogue==2.0.10
+certifi==2025.4.26
+cffi==1.17.1
+charset-normalizer==3.4.2
+click==8.2.0
+cloudpathlib==0.21.0
+colorama==0.4.6
+confection==0.1.5
+cryptography==44.0.3
+cymem==2.0.11
+dnspython==2.7.0
+ecdsa==0.19.1
+email-validator==2.2.0
+h11==0.16.0
+httpcore==1.0.9
+httplib2==0.22.0
+httptools==0.6.4
+httpx==0.28.1
+idna==3.10
+Jinja2==3.1.6
+langcodes==3.5.0
+language_data==1.3.0
+lxml==5.4.0
+marisa-trie==1.2.1
+markdown-it-py==3.0.0
+MarkupSafe==3.0.2
+mdurl==0.1.2
+motor==3.7.0
+murmurhash==1.0.12
+numpy==2.2.5
+packaging==25.0
+preshed==3.0.9
+protobuf==4.25.7
+pyasn1==0.4.8
+pyasn1_modules==0.4.1
+pycparser==2.22
+Pygments==2.19.1
+pyparsing==3.2.3
+rich==14.0.0
+rich-toolkit==0.14.5
+rsa==4.9.1
+shellingham==1.5.4
+six==1.17.0
+smart-open==7.1.0
+sniffio==1.3.1
+spacy-legacy==3.0.12
+spacy-loggers==1.0.5
+srsly==2.5.1
+starlette==0.37.2
+thinc==8.3.6
+tqdm==4.67.1
+typer==0.15.3
+typing-inspection==0.4.0
+uritemplate==4.1.1
+urllib3==2.4.0
+wasabi==1.1.3
+watchfiles==1.0.5
+weasel==0.4.1
+websockets==15.0.1
+wrapt==1.17.2
