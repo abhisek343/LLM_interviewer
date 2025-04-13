@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  backend:
+    build: .
+    ports:
+      - "8000:8000"
+      environment:
+      - MONGODB_URL=${MONGODB_URL} 
+      - GEMINI_API_KEY=${GEMINI_API_KEY} 
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY} 
+      - JWT_ALGORITHM=${JWT_ALGORITHM} 
+      - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES} 
+    depends_on:
+      - mongodb
+    volumes:
+      - .:/app
+    networks:
+      - llm-network
+
+  mongodb:
+    image: mongo:4.4
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - llm-network
+
+networks:
+  llm-network:
+    driver: bridge
+
+volumes:
+  mongodb_data: 
