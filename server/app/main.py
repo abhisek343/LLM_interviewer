@@ -1,130 +1,88 @@
-# llm_managment_system2/server/app/main.py
+# LLM_interviewer/server/app/main.py
 
-from fastapi import FastAPI, Request, status # Added Request, status
-from fastapi.exceptions import RequestValidationError # Added RequestValidationError
-from fastapi.responses import JSONResponse # Added JSONResponse (optional if you customize response)
+import logging
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.routes import auth, interview
-from app.db.mongodb import mongodb
-from app.core.config import get_settings
-import logging # Added logging
-from datetime import datetime # Ensure datetime is imported if used in seeding
-# Import security utils if needed for seeding
-from app.core.security import get_password_hash
+from contextlib import asynccontextmanager
 
-# Configure logging
+# Import settings and database connection
+from app.core.config import settings
+from app.db.mongodb import mongodb
+
+# Import API routers
+from app.api.routes import auth, candidates, interview, admin
+
+# Import seeding functions (ensure these paths are correct)
+# Assuming seed_admin_user might be in a separate file like seed_data.py
+# Adjust the import path if your structure is different
+try:
+    from app.db.seed_data import seed_admin_user
+except ImportError:
+    # Define a dummy function if seed_data doesn't exist or is optional
+    async def seed_admin_user():
+        logging.warning("seed_admin_user function not found or import failed.")
+        pass # Do nothing if not found
+
+from app.db.seed_default_questions import seed_default_questions
+
+
+# --- Logging Setup ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-settings = get_settings()
-
-app = FastAPI(
-    title="LLM Interview System",
-    description="API for managing technical interviews with LLM-powered question generation",
-    version="1.0.0"
-)
-
-# --- Add the Exception Handler Here ---
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """
-    Handles Pydantic validation errors globally.
-    Logs the detailed error and re-raises to let FastAPI generate the default 422 response.
-    """
-    # Log the detailed validation errors on the server side for debugging
-    # exc.errors() provides a list of dicts with error details
-    # exc.body might contain the raw request body if needed
-    error_details = exc.errors()
-    logger.warning(f"Validation error for request {request.method} {request.url}: {error_details}")
-    # logger.debug(f"Request body causing validation error: {exc.body}") # Uncomment for more debugging
-
-    # Option 1 (Recommended): Re-raise to use FastAPI's default 422 response format
-    # This is usually best as the client-side code was adapted to handle this format.
-    raise exc
-
-    # Option 2: Return a custom JSON response (Uncomment below and comment out 'raise exc' if needed)
-    # return JSONResponse(
-    #     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-    #     # You can customize the content structure here if necessary
-    #     content={"detail": error_details}
-    # )
-# --- End of Exception Handler ---
-
-
-# --- Optional: Function to Seed Default Admin ---
-async def seed_default_admin():
-    """Checks for and creates the default admin user if they don't exist."""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Handle startup and shutdown events."""
+    logger.info("Application startup...")
     try:
-        db = mongodb.get_db() # Make sure mongodb is connected
-
-        # Safely get settings from .env, provide fallbacks if necessary
-        admin_email = getattr(settings, 'DEFAULT_ADMIN_EMAIL', None)
-        admin_username = getattr(settings, 'DEFAULT_ADMIN_USERNAME', None)
-        admin_password = getattr(settings, 'DEFAULT_ADMIN_PASSWORD', None)
-
-        if not all([admin_email, admin_username, admin_password]):
-            logger.warning("Default admin credentials not fully configured in .env. Skipping admin seeding.")
-            return
-
-        existing_admin = await db.users.find_one({"email": admin_email})
-
-        if not existing_admin:
-            logger.info(f"Default admin user '{admin_email}' not found. Creating...")
-            hashed_password = get_password_hash(admin_password)
-            admin_doc = {
-                "username": admin_username,
-                "email": admin_email,
-                "hashed_password": hashed_password,
-                "role": "admin", # Explicitly set role
-                "created_at": datetime.utcnow()
-            }
-            await db.users.insert_one(admin_doc)
-            logger.info(f"Default admin user '{admin_email}' created successfully.")
-        else:
-            logger.info(f"Default admin user '{admin_email}' already exists.")
+        await mongodb.connect()
+        # Call seeding functions after successful connection
+        await seed_admin_user()
+        await seed_default_questions()
+        yield
     except Exception as e:
-        logger.error(f"Error during admin user seeding: {e}", exc_info=True)
+        logger.critical(f"FATAL: Failed to connect to MongoDB or seed data during startup: {e}", exc_info=True)
+        raise
+    finally:
+        logger.info("Application shutdown...")
+        await mongodb.close()
 
-# --- End of Admin Seeding Function ---
-
-
-# Configure CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS, # Use specific origins from settings in production is safer
-    # allow_origins=["*"], # Use "*" for broad development access if needed, but less secure
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# --- FastAPI App Initialization ---
+# Correctly define the 'app' instance here
+app = FastAPI(
+    title=settings.APP_NAME,
+    openapi_url="/openapi.json", # Standard location
+    lifespan=lifespan
 )
 
-# Include routers
-# Ensure the prefix is defined within the router files (auth.py, interview.py)
-# e.g., router = APIRouter(prefix="/auth", tags=["auth"])
-app.include_router(auth.router)
-app.include_router(interview.router)
 
-@app.on_event("startup")
-async def startup_db_client():
-    logger.info("Application startup: Connecting to MongoDB...")
-    await mongodb.connect()
-    logger.info("Application startup: MongoDB connected.")
-    # --- Seed the default admin user on startup ---
-    # Note: Running this on every startup might have slight overhead.
-    # Running a separate seeding script once is often preferred for production.
-    await seed_default_admin()
-    # ---
+# --- Middleware Setup ---
+# Add CORS middleware using settings
+if settings.CORS_ALLOWED_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.CORS_ALLOWED_ORIGINS, # Use parsed list from settings
+        allow_credentials=True,
+        allow_methods=["*"], # Allow all standard methods
+        allow_headers=["*"], # Allow all headers
+    )
+    logger.info(f"CORS enabled for origins: {settings.CORS_ALLOWED_ORIGINS}")
+else:
+     logger.warning("CORS_ALLOWED_ORIGINS not set. CORS middleware not added.")
 
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    logger.info("Application shutdown: Closing MongoDB connection...")
-    await mongodb.close()
-    logger.info("Application shutdown: MongoDB connection closed.")
 
-@app.get("/")
-async def root():
-    """
-    Root endpoint for the API.
-    """
-    return {"message": "Welcome to LLM Interview System API"}
+# --- Include API Routers ---
+app.include_router(auth.router, prefix="/api/v1")
+app.include_router(candidates.router, prefix="/api/v1")
+app.include_router(interview.router, prefix="/api/v1")
+app.include_router(admin.router, prefix="/api/v1")
+logger.info("Included API routers.")
+
+# --- Root Endpoint ---
+@app.get("/", tags=["Root"])
+async def read_root():
+    """A simple endpoint to confirm the API is running."""
+    return {"message": f"Welcome to the {settings.APP_NAME} API"}
+
+# Note: No TestClient should be instantiated here.
+# TestClient is for use within test files only.

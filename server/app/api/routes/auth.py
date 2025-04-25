@@ -1,174 +1,131 @@
-# llm_managment_system2/server/app/api/routes/auth.py
+# LLM_interviewer/server/app/api/routes/auth.py
 
 from datetime import timedelta, datetime
-from fastapi import APIRouter, Depends, HTTPException, status, Request
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from app.core.security import verify_password, get_password_hash, create_access_token
-from app.schemas.user import UserCreate, UserOut, Token, TokenData # Use schemas defined in schemas/user.py
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm # Keep this for /login route
+from app.core.security import (
+    verify_password,
+    get_password_hash,
+    create_access_token,
+    get_current_active_user # Import the main dependency from security.py
+)
+from app.schemas.user import UserCreate, UserOut, Token, TokenData # Schemas are needed here
 from app.db.mongodb import mongodb # Import the mongodb instance
-from app.core.config import get_settings
-from typing import Optional
-from jose import JWTError, jwt
-import logging # Import logging
-
-router = APIRouter(prefix="/auth", tags=["auth"])
-settings = get_settings()
-# Use relative path within the API, assuming base path handles prefix correctly
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login") # Simplified tokenUrl
+from app.core.config import settings # Import settings instance directly
+from app.models.user import UserRole # Import UserRole
+import logging
+from app.core.security import get_current_active_user # Or get_current_user if you prefer
+router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 # Logger setup
 logger = logging.getLogger(__name__)
 
-# --- Register Endpoint ---
-# Changed response_model to UserOut if you want user details, or kept Token if only token is needed.
-# Let's keep Token as per original intent, implies successful registration gives a login token.
-@router.post("/register", response_model=Token, status_code=status.HTTP_201_CREATED)
-async def register(user: UserCreate):
-    # Assuming mongodb.get_db() correctly returns the database object based on prior setup
-    db = mongodb.get_database() # Using get_database() as defined in original mongodb.py
-    if not db:
-         logger.error("Failed to get database instance in /register")
-         raise HTTPException(status_code=500, detail="Database connection not available.")
 
-    # Check if user already exists
-    existing_user = await db.users.find_one({"email": user.email})
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email already registered."
-        )
+# --- Register Endpoint ---
+@router.post("/register", response_model=UserOut, status_code=status.HTTP_201_CREATED)
+async def register(user: UserCreate):
+    """Registers a new user (candidate, hr, or admin)."""
+    # Check if role is valid (Pydantic already does this via UserRole)
+    # if user.role not in [UserRole.candidate, UserRole.hr, UserRole.admin]:
+    #     raise HTTPException(status_code=400, detail="Invalid role specified")
 
     try:
+        db = mongodb.get_db()
+        # Check if email already exists
+        existing_user_email = await db[settings.MONGODB_COLLECTION_USERS].find_one({"email": user.email})
+        if existing_user_email:
+            logger.warning(f"Registration attempt failed: Email '{user.email}' already exists.")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already registered."
+            )
+        # Check if username already exists
+        existing_user_username = await db[settings.MONGODB_COLLECTION_USERS].find_one({"username": user.username})
+        if existing_user_username:
+             logger.warning(f"Registration attempt failed: Username '{user.username}' already exists.")
+             raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Username already registered."
+             )
+
         # Create new user
         hashed_password = get_password_hash(user.password)
-        user_doc = user.model_dump(exclude={"password"}) # Use model_dump for Pydantic v2
+        user_doc = user.model_dump(exclude={"password"})
         user_doc["hashed_password"] = hashed_password
-        user_doc["created_at"] = datetime.utcnow() # Fix for created_at validation
+        user_doc["created_at"] = datetime.utcnow()
 
         # Insert user into database
-        result = await db.users.insert_one(user_doc)
+        result = await db[settings.MONGODB_COLLECTION_USERS].insert_one(user_doc)
+        created_user_doc = await db[settings.MONGODB_COLLECTION_USERS].find_one({"_id": result.inserted_id})
 
-        # We need the user details to create the token payload
-        created_user = await db.users.find_one({"_id": result.inserted_id})
-        if not created_user:
-            # This should ideally not happen if insert was successful
+        if not created_user_doc:
             logger.error(f"Failed to retrieve created user after insert for email: {user.email}")
-            raise HTTPException(status_code=500, detail="Failed to retrieve created user.")
+            raise HTTPException(status_code=500, detail="Failed to create user account.")
 
-        # Validate the created user data (optional but good practice)
-        # No need to convert _id to id here as UserOut doesn't use it
-        try:
-            user_for_token = UserOut.model_validate(created_user)
-        except Exception as validation_error:
-            logger.error(f"Failed to validate created user data: {validation_error}")
-            raise HTTPException(status_code=500, detail="Failed processing created user data.")
+        logger.info(f"User '{user.username}' ({user.email}) registered successfully as '{user.role}'.")
+        # Return the created user details using UserOut schema
+        return UserOut.model_validate(created_user_doc)
 
-        # Create access token
-        access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-        access_token = create_access_token(
-            data={"sub": user_for_token.email, "role": user_for_token.role}, # Use data from validated user
-            expires_delta=access_token_expires
-        )
-
-        # Return only the token, matching the Token response_model
-        return {"access_token": access_token, "token_type": "bearer"}
-
+    except HTTPException:
+        raise
     except Exception as e:
-        # Log unexpected errors during registration process
         logger.error(f"Error during user registration for {user.email}: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An unexpected error occurred during registration."
         )
 
+
 # --- Login Endpoint ---
-# Changed response_model to Token, assuming login returns token + user info
-@router.post("/login", response_model=Token) # Kept Token, adjust if needed
+@router.post("/login", response_model=Token) # Login returns a token
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    db = mongodb.get_database() # Using get_database()
-    if not db:
-         logger.error("Failed to get database instance in /login")
-         raise HTTPException(status_code=500, detail="Database connection not available.")
+    """Logs in a user and returns an access token."""
+    try:
+        db = mongodb.get_db()
+        user_from_db = await db[settings.MONGODB_COLLECTION_USERS].find_one({"email": form_data.username}) # Use email as username for login
 
-    # Note: OAuth2PasswordRequestForm uses 'username' field for the email
-    user_from_db = await db.users.find_one({"email": form_data.username})
+        if not user_from_db or not verify_password(form_data.password, user_from_db["hashed_password"]):
+            logger.warning(f"Login attempt failed for email: {form_data.username} (User not found or incorrect password)")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect email or password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
 
-    if not user_from_db or not verify_password(form_data.password, user_from_db["hashed_password"]):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
+        # Create access token including necessary details in payload
+        access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={
+                "sub": user_from_db["email"],
+                "role": user_from_db["role"],
+                # Include user ID (as string) in token if needed by frontend/other services
+                # "id": str(user_from_db["_id"])
+                },
+            expires_delta=access_token_expires
         )
 
-    # Validate against UserOut schema to get role etc. for token
-    # No need to convert _id to id here
-    try:
-        user_out = UserOut.model_validate(user_from_db)
-    except Exception as validation_error:
-         logger.error(f"Failed to validate user data from DB during login for {form_data.username}: {validation_error}")
-         raise HTTPException(status_code=500, detail="Failed processing user data.")
+        logger.info(f"Successful login for user {form_data.username}")
+        return {"access_token": access_token, "token_type": "bearer"}
 
-
-    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user_out.email, "role": user_out.role},
-        expires_delta=access_token_expires
-    )
-
-    # Return only the token, matching the Token response_model
-    return {"access_token": access_token, "token_type": "bearer"}
-
-
-# --- Dependency to get current user ---
-async def get_current_user(token: str = Depends(oauth2_scheme)) -> UserOut:
-    db = mongodb.get_database() # Using get_database()
-    if not db:
-         logger.error("Failed to get database instance in get_current_user")
-         # Decide how to handle this - raise 500 or a specific auth error?
-         # Raising 401 might mask DB issues but fits auth flow failure.
-         raise HTTPException(status_code=503, detail="Database service unavailable.")
-
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
-        email: Optional[str] = payload.get("sub")
-        role: Optional[str] = payload.get("role") # Assuming role is in token
-        if email is None: # Role might be optional depending on needs
-            logger.warning("Token missing email (sub).")
-            raise credentials_exception
-        # TokenData schema might not be strictly necessary if just passing email/role
-        # token_data = TokenData(email=email, role=role)
-    except JWTError as e:
-        logger.warning(f"JWTError decoding token: {e}")
-        raise credentials_exception from e
-
-    user = await db.users.find_one({"email": email})
-    if user is None:
-        logger.warning(f"User not found for email from token: {email}")
-        raise credentials_exception
-
-    # Validate the structure before returning
-    # No need to convert _id to id here
-    try:
-        user_out = UserOut.model_validate(user)
-        # Verify role from DB matches token role if necessary
-        # if user_out.role != role:
-        #     logger.warning(f"Role mismatch for user {email}. Token role: {role}, DB role: {user_out.role}")
-        #     raise credentials_exception
-        return user_out
-    except Exception as e: # Catch validation errors specifically if needed
-        logger.error(f"Failed to validate user data from DB for {email}: {e}")
-        raise credentials_exception
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during login for {form_data.username}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred during login."
+        )
 
 
 # --- Get Current User Endpoint ---
+# This endpoint now relies on the dependency moved to security.py
 @router.get("/me", response_model=UserOut)
-async def read_users_me(current_user: UserOut = Depends(get_current_user)):
+async def read_users_me(current_user: UserOut = Depends(get_current_active_user)):
     """
     Returns the details of the currently authenticated user.
     """
+    logger.info(f"Fetching profile for current user: {current_user.username}")
     return current_user
+
+# Note: The `get_current_user` function definition that was previously here has been moved to `security.py`.
+# The `oauth2_scheme` is now defined and used within `security.py`.

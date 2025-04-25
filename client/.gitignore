@@ -40,3 +40,5 @@ Thumbs.db
 # Optional vitest coverage output
 coverage/
 .nyc_output/
+#ignoring the test files
+*.test.jsx

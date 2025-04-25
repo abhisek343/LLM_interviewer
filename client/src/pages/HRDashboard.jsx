@@ -1,207 +1,359 @@
 import React, { useState, useEffect } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
-import { interviewAPI } from '../utils/apiClient';
+import { useAuth } from '../contexts/AuthContext';
+import Layout from '../components/Layout';
+import { useNavigate } from 'react-router-dom';
+// Import specific API objects for clarity
+import { adminAPI, interviewAPI } from '../utils/apiClient';
 
 const HRDashboard = () => {
+  const { user } = useAuth(); // Assuming user object contains HR info if needed
   const navigate = useNavigate();
-  const [candidates, setCandidates] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  const [success, setSuccess] = useState('');
 
-  const [formData, setFormData] = useState({
-    candidate_id: '',
+  // State for data display
+  const [candidates, setCandidates] = useState([]);
+  const [allInterviews, setAllInterviews] = useState([]); // Renamed for clarity
+  const [completedInterviews, setCompletedInterviews] = useState([]); // Changed state name and purpose
+
+  // Loading states
+  const [loadingCandidates, setLoadingCandidates] = useState(true);
+  const [loadingInterviews, setLoadingInterviews] = useState(true);
+  const [loadingCompleted, setLoadingCompleted] = useState(true); // Changed state name
+
+  // Error states
+  const [errorCandidates, setErrorCandidates] = useState(null);
+  const [errorInterviews, setErrorInterviews] = useState(null);
+  const [errorCompleted, setErrorCompleted] = useState(null); // Changed state name
+
+  // State for scheduling interview modal/form
+  const [showScheduleModal, setShowScheduleModal] = useState(false);
+  const [scheduleData, setScheduleData] = useState({
+    candidate_id: '', // This should be the candidate's User ID (string from MongoDB ObjectId)
     scheduled_time: '',
     role: '',
-    tech_stack: '',
+    tech_stack: [], // Keep as array
+    // num_questions is part of form but not primary API input, backend uses default
   });
+  const [schedulingError, setSchedulingError] = useState(null);
+  const [isScheduling, setIsScheduling] = useState(false); // Loading state for schedule button
 
+  // --- Data Fetching ---
   useEffect(() => {
-    // In a real app, you'd fetch candidates from your backend
-    setCandidates([
-      { id: '1', name: 'John Doe', email: 'john@example.com' },
-      { id: '2', name: 'Jane Smith', email: 'jane@example.com' },
-    ]);
-  }, []);
+    // Fetch data needed for the HR dashboard
+    fetchCandidates();
+    fetchAllInterviews();
+    fetchCompletedInterviews(); // Fetch completed interviews instead of results
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    setLoading(true);
-    setError('');
-    setSuccess('');
+    // user dependency is okay if some filtering might happen based on HR user later
+  }, [user]);
 
+  const fetchCandidates = async () => {
+    setLoadingCandidates(true);
+    setErrorCandidates(null);
     try {
-      const response = await interviewAPI.schedule(formData);
-      setSuccess('Interview scheduled successfully!');
-      setFormData({
-        candidate_id: '',
-        scheduled_time: '',
-        role: '',
-        tech_stack: '',
-      });
+      // Use adminAPI to get all users, then filter for candidates
+      const response = await adminAPI.getUsers();
+      // Assuming response.data is an array of User objects based on UserResponse schema
+      const candidateUsers = response.data.filter(u => u.role === 'candidate');
+      setCandidates(candidateUsers);
     } catch (err) {
-      setError(err.response?.data?.detail || 'Failed to schedule interview');
+      console.error("Failed to fetch users (for candidates):", err);
+      setErrorCandidates(`Failed to fetch candidates. ${err.message || err}`);
     } finally {
-      setLoading(false);
+      setLoadingCandidates(false);
     }
   };
 
-  const handleChange = (e) => {
-    const { name, value } = e.target;
-    setFormData(prev => ({
-      ...prev,
-      [name]: value
-    }));
+  const fetchAllInterviews = async () => {
+    setLoadingInterviews(true);
+    setErrorInterviews(null);
+    try {
+      // Use the specific API function for getting all interviews
+      const response = await interviewAPI.getAllInterviews();
+      setAllInterviews(response.data); // Assuming response.data is List[InterviewOut]
+    } catch (err) {
+      console.error("Failed to fetch all interviews:", err);
+      setErrorInterviews(`Failed to fetch interviews. ${err.message || err}`);
+    } finally {
+      setLoadingInterviews(false);
+    }
   };
 
+  const fetchCompletedInterviews = async () => {
+    setLoadingCompleted(true);
+    setErrorCompleted(null);
+    try {
+      // Use the API function that gets completed interviews (which is /results/all on backend)
+      // This endpoint returns List[InterviewOut] for completed interviews
+      const response = await interviewAPI.getAllResults(); // Correct endpoint mapping
+      setCompletedInterviews(response.data);
+    } catch (err) {
+      console.error("Failed to fetch completed interviews:", err);
+      setErrorCompleted(`Failed to fetch completed interviews. ${err.message || err}`);
+    } finally {
+      setLoadingCompleted(false);
+    }
+  };
+
+  // --- Scheduling Form Handlers ---
+  const handleScheduleInputChange = (e) => {
+    const { name, value } = e.target;
+    setScheduleData({ ...scheduleData, [name]: value });
+  };
+
+   const handleTechStackChange = (e) => {
+      const { value } = e.target;
+      // Split comma-separated string into array, trim whitespace, filter empty strings
+      const stackArray = value.split(',')
+                            .map(item => item.trim())
+                            .filter(item => item !== '');
+      setScheduleData({ ...scheduleData, tech_stack: stackArray });
+   };
+
+  const handleScheduleSubmit = async (e) => {
+    e.preventDefault();
+    setSchedulingError(null);
+    setIsScheduling(true);
+
+    // Basic validation
+    // **Important**: Ensure candidate_id here is the *string representation* of the MongoDB ObjectId
+    if (!scheduleData.candidate_id || !scheduleData.scheduled_time || !scheduleData.role || scheduleData.tech_stack.length === 0) {
+      setSchedulingError('Please fill in all required fields (Candidate ID, Time, Role, Tech Stack).');
+      setIsScheduling(false);
+      return;
+    }
+
+    // Prepare data matching InterviewCreate schema (role, tech_stack included)
+    const dataToSubmit = {
+        candidate_id: scheduleData.candidate_id,
+        scheduled_time: scheduleData.scheduled_time,
+        role: scheduleData.role,
+        tech_stack: scheduleData.tech_stack,
+    };
+
+    try {
+      await interviewAPI.schedule(dataToSubmit);
+      setShowScheduleModal(false);
+      setScheduleData({ // Reset form
+        candidate_id: '', scheduled_time: '', role: '', tech_stack: []
+      });
+      fetchAllInterviews(); // Refresh interview list
+      alert('Interview scheduled successfully!');
+    } catch (err) {
+      console.error("Failed to schedule interview:", err);
+      // Display more specific backend error if available
+      setSchedulingError(`Failed to schedule interview. ${err.detail || err.message || err}`);
+    } finally {
+      setIsScheduling(false);
+    }
+  };
+
+  // Navigate to specific result/interview detail page
+  // Since backend /results/all returns completed interviews, link to interview detail page
+  const viewInterviewDetails = (interviewId) => {
+    // We can navigate to a generic interview detail page if one exists,
+    // or reuse the result detail page if it's adapted to show interview info.
+    // Let's assume we navigate to a URL structure like /interview/detail/:id
+    // If no such page exists, this navigation won't work.
+    // navigate(`/interview/detail/${interviewId}`);
+    // Or, for now, maybe just log it or disable the button
+     console.log(`Navigate to details for interview ID: ${interviewId}`);
+     alert(`Viewing details for interview ${interviewId} - Detail page needs implementation.`);
+     // Alternatively, use the candidate's result view page if adaptable:
+     // navigate(`/results/${interviewId}`); // If ResultDetailPage can handle InterviewOut data
+  };
+
+
+  // --- Render ---
   return (
-    <div className="min-h-screen bg-[#1c1f2e] text-white font-sans">
-      <div className="flex">
-        {/* Sidebar */}
-        <aside className="w-64 h-screen bg-[#212437] p-4 hidden md:block">
-          <div className="mb-8 text-2xl font-bold">HR Dashboard</div>
-          <ul className="space-y-4 text-sm text-gray-300">
-            <li className="flex items-center space-x-2 text-white">
-              <span>🏠</span>
-              <Link to="/hr" className="hover:text-white">Dashboard</Link>
-            </li>
-            <li className="flex items-center space-x-2">
-              <span>📧</span>
-              <span>Invite Candidates</span>
-            </li>
-            <li className="flex items-center space-x-2">
-              <span>📑</span>
-              <Link to="/hr/results/1" className="hover:text-white">View Results</Link>
-            </li>
-            <li className="flex items-center space-x-2">
-              <span>⚙️</span>
-              <span>Settings</span>
-            </li>
-            <li className="flex items-center space-x-2">
-              <span>🚪</span>
-              <button onClick={() => navigate('/')} className="hover:text-white">Signout</button>
-            </li>
-          </ul>
-        </aside>
+    <Layout>
+      <div className="space-y-6">
+        {/* Schedule Interview Section */}
+        <div className="bg-gray-800 p-6 rounded-lg shadow">
+          <h2 className="text-xl font-semibold mb-4">Schedule New Interview</h2>
+          <button
+            onClick={() => setShowScheduleModal(true)}
+            className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md disabled:opacity-50"
+            disabled={loadingCandidates} // Disable if candidates haven't loaded
+          >
+            Schedule Interview
+          </button>
 
-        {/* Main Content */}
-        <main className="flex-1 p-6 space-y-6">
-          {/* Top Bar */}
-          <div className="flex justify-between items-center bg-[#2a2e42] p-4 rounded-xl">
-            <h1 className="text-xl font-bold">Welcome, HR!</h1>
-            <div className="flex items-center space-x-4 ml-auto">
-              <span>🔔</span>
-              <span className="rounded-full w-8 h-8 bg-white text-black flex items-center justify-center">🧑‍💼</span>
-            </div>
-          </div>
-
-          {/* Invite Section */}
-          <div className="bg-[#2a2e42] p-4 rounded-xl">
-            <h4 className="text-lg font-semibold mb-2">Invite Candidate</h4>
-            <p className="text-sm text-gray-400 mb-4">Enter candidate's email to send an interview invite:</p>
-            <div className="flex space-x-4">
-              <input type="email" placeholder="candidate@example.com" className="bg-[#1c1f2e] text-white px-4 py-2 rounded w-full focus:outline-none" />
-              <button className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded text-white text-sm">Send Invite</button>
-            </div>
-          </div>
-
-          {/* Results Section */}
-          <div className="bg-[#2a2e42] p-4 rounded-xl">
-            <h4 className="text-lg font-semibold mb-2">Candidate Interview Results</h4>
-            <p className="text-sm text-gray-400">Review scores and feedback from recent interviews.</p>
-            <p className="text-sm text-gray-400 mt-2">(Results table placeholder)</p>
-          </div>
-
-          <div className="max-w-md mx-auto">
-            <div className="divide-y divide-gray-200">
-              <div className="py-8 text-base leading-6 space-y-4 text-gray-700 sm:text-lg sm:leading-7">
-                <h2 className="text-2xl font-bold mb-6">Schedule Interview</h2>
-                
-                {error && (
-                  <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative" role="alert">
-                    <span className="block sm:inline">{error}</span>
-                  </div>
-                )}
-                
-                {success && (
-                  <div className="bg-green-100 border border-green-400 text-green-700 px-4 py-3 rounded relative" role="alert">
-                    <span className="block sm:inline">{success}</span>
-                  </div>
-                )}
-
-                <form onSubmit={handleSubmit} className="space-y-4">
+          {/* Schedule Interview Modal */}
+          {showScheduleModal && (
+            <div className="fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center z-50 transition-opacity duration-300">
+              <div className="bg-gray-800 p-6 rounded-lg shadow-xl w-full max-w-lg transform transition-all duration-300 scale-100">
+                <h3 className="text-lg font-semibold mb-4 text-white">Schedule Interview</h3>
+                <form onSubmit={handleScheduleSubmit} className="space-y-4">
                   <div>
-                    <label className="block text-sm font-medium text-gray-700">Candidate</label>
+                    <label htmlFor="candidate_id" className="block text-sm font-medium text-gray-300">Candidate</label>
+                    {/* Use a select dropdown populated from fetched candidates */}
                     <select
                       name="candidate_id"
-                      value={formData.candidate_id}
-                      onChange={handleChange}
-                      className="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md"
+                      id="candidate_id"
+                      value={scheduleData.candidate_id}
+                      onChange={handleScheduleInputChange}
+                      className="mt-1 block w-full rounded-md bg-gray-700 border-gray-600 text-white py-2 px-3 focus:ring-blue-500 focus:border-blue-500"
                       required
+                      disabled={loadingCandidates || candidates.length === 0}
                     >
-                      <option value="">Select a candidate</option>
-                      {candidates.map(candidate => (
-                        <option key={candidate.id} value={candidate.id}>
-                          {candidate.name} ({candidate.email})
+                      <option value="" disabled>{loadingCandidates ? 'Loading...' : 'Select a Candidate'}</option>
+                      {!loadingCandidates && candidates.map(c => (
+                        <option key={c.id} value={c.id}>
+                          {c.username} ({c.email})
                         </option>
                       ))}
                     </select>
+                     {candidates.length === 0 && !loadingCandidates && <p className="text-xs text-yellow-500 mt-1">No candidates found. Register candidates first.</p>}
                   </div>
-
                   <div>
-                    <label className="block text-sm font-medium text-gray-700">Scheduled Time</label>
+                    <label htmlFor="scheduled_time" className="block text-sm font-medium text-gray-300">Scheduled Time</label>
                     <input
                       type="datetime-local"
                       name="scheduled_time"
-                      value={formData.scheduled_time}
-                      onChange={handleChange}
-                      className="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md"
+                      id="scheduled_time"
+                      value={scheduleData.scheduled_time}
+                      onChange={handleScheduleInputChange}
+                      className="mt-1 block w-full rounded-md bg-gray-700 border-gray-600 text-white py-2 px-3 focus:ring-blue-500 focus:border-blue-500"
                       required
                     />
                   </div>
-
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700">Role</label>
+                   <div>
+                    <label htmlFor="role" className="block text-sm font-medium text-gray-300">Job Role</label>
                     <input
                       type="text"
                       name="role"
-                      value={formData.role}
-                      onChange={handleChange}
-                      placeholder="e.g., Software Engineer"
-                      className="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md"
+                      id="role"
+                      placeholder="e.g., Software Engineer, Data Scientist"
+                      value={scheduleData.role}
+                      onChange={handleScheduleInputChange}
+                      className="mt-1 block w-full rounded-md bg-gray-700 border-gray-600 text-white py-2 px-3 focus:ring-blue-500 focus:border-blue-500"
                       required
                     />
                   </div>
-
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700">Tech Stack</label>
+                   <div>
+                    <label htmlFor="tech_stack_input" className="block text-sm font-medium text-gray-300">Tech Stack (comma-separated)</label>
                     <input
                       type="text"
-                      name="tech_stack"
-                      value={formData.tech_stack}
-                      onChange={handleChange}
-                      placeholder="e.g., Python, React, MongoDB"
-                      className="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md"
+                      name="tech_stack_input" // Use different name to avoid direct state binding confusion
+                      id="tech_stack_input"
+                      placeholder="e.g., Python, React, Docker"
+                      // Display current tech_stack array joined by comma
+                      defaultValue={scheduleData.tech_stack.join(', ')}
+                      // Use onBlur or a separate handler if needed, onChange handles parsing
+                      onChange={handleTechStackChange}
+                      className="mt-1 block w-full rounded-md bg-gray-700 border-gray-600 text-white py-2 px-3 focus:ring-blue-500 focus:border-blue-500"
                       required
                     />
                   </div>
-
-                  <div>
+                  {/* Removed num_questions from form - backend decides this */}
+                  {schedulingError && <p className="text-red-500 text-sm mt-2">{schedulingError}</p>}
+                  <div className="flex justify-end space-x-3 pt-4">
+                    <button
+                      type="button"
+                      onClick={() => setShowScheduleModal(false)}
+                      className="px-4 py-2 text-gray-300 rounded-md border border-gray-600 hover:bg-gray-700 transition duration-150"
+                      disabled={isScheduling}
+                    >
+                      Cancel
+                    </button>
                     <button
                       type="submit"
-                      disabled={loading}
-                      className="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
+                      className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md transition duration-150 disabled:opacity-50"
+                      disabled={isScheduling || candidates.length === 0}
                     >
-                      {loading ? 'Scheduling...' : 'Schedule Interview'}
+                      {isScheduling ? 'Scheduling...' : 'Schedule'}
                     </button>
                   </div>
                 </form>
               </div>
             </div>
-          </div>
-        </main>
+          )}
+        </div>
+
+
+        {/* Candidates Section (Unchanged - relies on adminAPI.getUsers) */}
+        <div className="bg-gray-800 p-6 rounded-lg shadow">
+          <h2 className="text-xl font-semibold mb-4">Registered Candidates</h2>
+          {loadingCandidates ? <p>Loading candidates...</p> :
+           errorCandidates ? <p className="text-red-500">{errorCandidates}</p> :
+           candidates.length === 0 ? <p>No candidates registered.</p> : (
+            <div className="space-y-3 max-h-60 overflow-y-auto">
+              {candidates.map((candidate) => (
+                <div key={candidate.id} className="bg-gray-700 p-3 rounded-lg">
+                    <p className="font-medium text-white">{candidate.username}</p>
+                    <p className="text-gray-400 text-sm">{candidate.email}</p>
+                    <p className="text-gray-500 text-xs">ID: {candidate.id}</p>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* All Scheduled/In-Progress Interviews Section */}
+         <div className="bg-gray-800 p-6 rounded-lg shadow">
+            <h2 className="text-xl font-semibold mb-4">Scheduled & In-Progress Interviews</h2>
+             {loadingInterviews ? <p>Loading interviews...</p> :
+              errorInterviews ? <p className="text-red-500">{errorInterviews}</p> :
+              allInterviews.filter(i => i.status !== 'completed').length === 0 ? <p>No active interviews found.</p> : (
+                <div className="space-y-3 max-h-80 overflow-y-auto">
+                    {/* Filter interviews that are NOT completed */}
+                    {allInterviews.filter(i => i.status !== 'completed').map((interview) => (
+                        <div key={interview.interview_id} className="bg-gray-700 p-4 rounded-lg">
+                             <h3 className="font-medium">{interview.role}</h3>
+                             <p className="text-sm"><span className="text-gray-400">Candidate ID:</span> {interview.candidate_id}</p>
+                             <p className="text-sm"><span className="text-gray-400">Status:</span> <span className={`font-semibold ${interview.status === 'scheduled' ? 'text-yellow-400' : 'text-blue-400'}`}>{interview.status}</span></p>
+                             <p className="text-sm"><span className="text-gray-400">Tech Stack:</span> {interview.tech_stack.join(', ')}</p>
+                              {interview.scheduled_time && (
+                                    <p className="text-gray-400 text-sm">
+                                        Scheduled: {new Date(interview.scheduled_time).toLocaleString()}
+                                    </p>
+                                )}
+                             {/* Maybe add link to view questions? */}
+                        </div>
+                    ))}
+                </div>
+             )}
+         </div>
+
+
+        {/* Completed Interviews Section (formerly Results) */}
+        <div className="bg-gray-800 p-6 rounded-lg shadow">
+          <h2 className="text-xl font-semibold mb-4">Completed Interviews</h2>
+          {loadingCompleted ? <p>Loading completed interviews...</p> :
+           errorCompleted ? <p className="text-red-500">{errorCompleted}</p> :
+           completedInterviews.length === 0 ? <p>No completed interviews found.</p> : (
+            <div className="space-y-3 max-h-80 overflow-y-auto">
+              {/* Display completed interviews based on the fetched List[InterviewOut] */}
+              {completedInterviews.map((interview) => (
+                <div key={interview.interview_id} className="bg-gray-700 p-4 rounded-lg flex justify-between items-center">
+                  <div>
+                    <h3 className="font-medium">{interview.role}</h3>
+                    <p className="text-sm"><span className="text-gray-400">Candidate ID:</span> {interview.candidate_id}</p>
+                     {/* Display completion time */}
+                      {interview.completed_at && (
+                         <p className="text-gray-400 text-sm">
+                            Completed: {new Date(interview.completed_at).toLocaleString()}
+                        </p>
+                    )}
+                    {/* Could add placeholder text about results being available */}
+                    <p className="text-xs text-green-400">Completed</p>
+                  </div>
+                  {/* Update button to view details, actual results need calculation/another page */}
+                  <button
+                    // Link to the specific result page (or interview detail page)
+                    onClick={() => viewInterviewDetails(interview.interview_id)}
+                    className="bg-green-600 hover:bg-green-700 text-white px-3 py-1 rounded-md text-xs"
+                  >
+                    View Details/Result
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
       </div>
-    </div>
+    </Layout>
   );
 };
 
