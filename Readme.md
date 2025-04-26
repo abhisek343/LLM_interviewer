@@ -53,38 +53,10 @@ Includes infrastructure for admin users and potential future system management f
 ### Containerization:
 - Docker, Docker Compose 🐳
 
-## Project Structure 📁
-
-```
-LLM_interviewer/
-├── client/         # React Frontend Code
-│   ├── public/
-│   ├── src/
-│   ├── .gitignore
-│   ├── index.html
-│   ├── package.json
-│   └── vite.config.js
-├── server/         # FastAPI Backend Code
-│   ├── app/        # Core application logic
-│   │   ├── api/    # API endpoint routers
-│   │   ├── core/   # Config, security
-│   │   ├── db/     # Database connection, seeding
-│   │   ├── models/ # Pydantic data models
-│   │   ├── schemas/# Pydantic API schemas
-│   │   └── services/# LLM service integration
-│   ├── tests/      # Pytest tests
-│   ├── .env.example # Environment variable template
-│   ├── .gitignore
-│   ├── docker-compose.yml
-│   ├── Dockerfile
-│   ├── requirements.txt
-│   └── requirements-dev.txt
-└── README.md       # This file
-```
 
 ## Prerequisites 🛠️
 
-1. Node.js and npm (or yarn)
+1. Node.js and npm 
 2. Python 3.9+ and pip
 3. Docker and Docker Compose
 4. Access to Google Gemini API (API Key)
