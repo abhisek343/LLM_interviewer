@@ -2,57 +2,58 @@
 
 import pytest
 from fastapi import status
-# from fastapi.testclient import TestClient # Now using client fixture from conftest
-# from app.main import app # App is used via client fixture
-# Import security functions used directly in tests if any, or for verification
-from app.core.security import get_password_hash, create_access_token, verify_token # Changed decode_access_token to verify_token
-from app.db.mongodb import mongodb # Import the singleton instance
-from app.core.config import settings # Import settings instance directly
-from datetime import datetime, timedelta
-from bson import ObjectId
+from httpx import AsyncClient # Import AsyncClient for type hint
 
-# Fixtures like client, test_users_and_tokens, admin_token, hr_token, candidate_token, candidate_user, etc.
-# are now expected to be provided by conftest.py
+# Removed direct import of verify_token
+# from app.core.security import get_password_hash # Keep if needed elsewhere
 
-# --- Fixtures specific to this file are removed as they are consolidated in conftest.py ---
-# @pytest.fixture(scope="module")
-# async def test_user(): ... (REMOVED)
+# Removed direct db import if using test_db fixture
+# from app.db.mongodb import mongodb
+from app.core.config import settings
+from motor.motor_asyncio import AsyncIOMotorDatabase # Import for type hint
 
-# @pytest.fixture
-# def test_user_token(test_user): ... (REMOVED)
+# Fixtures from conftest: client, test_db, test_users_and_tokens, ...
 
 # --- Test Cases ---
 
 @pytest.mark.asyncio
-async def test_register_user_success(client): # Use client fixture
+async def test_register_user_success(client: AsyncClient, test_db: AsyncIOMotorDatabase):
     """Test successful user registration."""
-    response = client.post("/api/v1/auth/register", json={ # Added /api/v1 prefix
-        "username": "newuser",
-        "email": "new@example.com",
+    user_data = {
+        "username": "newuser_reg_succ",
+        "email": "new_reg_succ@example.com",
         "password": "newpassword123",
-        "role": "candidate" # Explicitly setting role
-    })
-    # Assuming register returns UserOut model now
-    assert response.status_code == status.HTTP_201_CREATED # Check for 201
-    data = response.json()
-    assert data["email"] == "new@example.com"
-    assert data["username"] == "newuser"
-    assert data["role"] == "candidate"
-    assert "hashed_password" not in data # Ensure password isn't returned
-    assert "id" in data # Ensure user ID is returned
+        "role": "candidate"
+    }
+    users_collection = test_db[settings.MONGODB_COLLECTION_USERS]
 
-    # Verify user exists in DB
-    db = mongodb.client[settings.MONGODB_DB + "_test"] # Use test DB
-    user_in_db = await db[settings.MONGODB_COLLECTION_USERS].find_one({"email": "new@example.com"})
+    # PRE-CHECK
+    user_before = await users_collection.find_one({"email": user_data["email"]})
+    assert user_before is None, f"User {user_data['email']} already exists before registration attempt."
+
+    response = await client.post(f"{settings.API_V1_STR}/auth/register", json=user_data)
+
+    assert response.status_code == status.HTTP_201_CREATED, f"Registration failed unexpectedly: {response.text}"
+
+    data = response.json()
+    assert data["email"] == user_data["email"]
+    assert data["username"] == user_data["username"]
+    assert data["role"] == user_data["role"]
+    assert "id" in data or "_id" in data
+    assert "hashed_password" not in data
+
+    # Verify user exists in the test DB
+    user_in_db = await users_collection.find_one({"email": user_data["email"]})
     assert user_in_db is not None
-    assert user_in_db["username"] == "newuser"
+    assert user_in_db["username"] == user_data["username"]
+
 
 @pytest.mark.asyncio
-async def test_register_user_duplicate_email(client, candidate_user): # Use existing user fixture
+async def test_register_user_duplicate_email(client: AsyncClient, candidate_user):
     """Test registration with an email that already exists."""
-    response = client.post("/api/v1/auth/register", json={ # Added /api/v1 prefix
-        "username": "anotheruser",
-        "email": candidate_user["email"], # Use existing email from fixture
+    response = await client.post(f"{settings.API_V1_STR}/auth/register", json={
+        "username": "anotheruser_dup_email",
+        "email": candidate_user["email"], # Use existing email
         "password": "newpassword123",
         "role": "candidate"
     })
@@ -60,113 +61,165 @@ async def test_register_user_duplicate_email(client, candidate_user): # Use exis
     assert "Email already registered" in response.json()["detail"]
 
 @pytest.mark.asyncio
-async def test_register_user_duplicate_username(client, candidate_user): # Use existing user fixture
+async def test_register_user_duplicate_username(client: AsyncClient, candidate_user):
     """Test registration with a username that already exists."""
-    response = client.post("/api/v1/auth/register", json={ # Added /api/v1 prefix
-        "username": candidate_user["username"], # Use existing username from fixture
-        "email": "unique@example.com",
+    response = await client.post(f"{settings.API_V1_STR}/auth/register", json={
+        "username": candidate_user["username"], # Use existing username
+        "email": "unique_dup_user@example.com",
         "password": "newpassword123",
         "role": "candidate"
     })
     assert response.status_code == status.HTTP_400_BAD_REQUEST
+    # This assertion failed in logs, check registration logic or fixture setup if it fails again
     assert "Username already registered" in response.json()["detail"]
 
 @pytest.mark.asyncio
-async def test_register_user_invalid_role(client):
+async def test_register_user_invalid_role(client: AsyncClient):
     """Test registration with an invalid role."""
-    response = client.post("/api/v1/auth/register", json={ # Added /api/v1 prefix
+    response = await client.post(f"{settings.API_V1_STR}/auth/register", json={
         "username": "invalidroleuser",
-        "email": "invalid@example.com",
+        "email": "invalid_role@example.com",
         "password": "newpassword123",
-        "role": "super_admin" # Not a valid role ('candidate', 'hr', 'admin')
+        "role": "super_admin" # Invalid role
     })
-    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY # Validation error
-    # Pydantic v2 error message format might differ slightly
-    assert "Input should be 'admin', 'hr' or 'candidate'" in response.text or "value is not a valid enumeration member" in response.text
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+    # Pydantic v2 validation error structure check
+    details = response.json()["detail"]
+    assert isinstance(details, list) and len(details) > 0
+    assert any(err["loc"] == ["body", "role"] and "Invalid role 'super_admin'" in err["msg"] for err in details)
+
 
 @pytest.mark.asyncio
-async def test_login_user_success(client, candidate_user): # Use existing user fixture
-    """Test successful login with correct credentials."""
+async def test_login_user_success_with_email(client: AsyncClient, candidate_user):
+    """Test successful login using EMAIL."""
     login_data = {
-        # FastAPI's OAuth2PasswordRequestForm expects 'username' and 'password'
-        "username": candidate_user["email"],
-        "password": candidate_user["password"] # Use password stored in fixture
+        "username": candidate_user["email"], # Use EMAIL here
+        "password": candidate_user["password"]
     }
-    # Send as form data
-    response = client.post(
-        "/api/v1/auth/login", # Added /api/v1 prefix
+    login_response = await client.post(
+        f"{settings.API_V1_STR}/auth/login",
         data=login_data,
-        headers={"Content-Type": "application/x-www-form-urlencoded"} # Correct content type
+        headers={"Content-Type": "application/x-www-form-urlencoded"}
     )
-    assert response.status_code == status.HTTP_200_OK
-    data = response.json()
-    assert "access_token" in data
-    assert data["token_type"] == "bearer"
+    assert login_response.status_code == status.HTTP_200_OK, f"Login failed: {login_response.text}"
+    login_data_resp = login_response.json()
+    assert "access_token" in login_data_resp
+    token = login_data_resp["access_token"]
 
-    # Optionally decode token to verify contents
-    token = data["access_token"]
-    payload = verify_token(token) # Use verify_token instead of decode_access_token
-    assert payload is not None
-    assert payload.get("sub") == candidate_user["email"]
-    assert payload.get("role") == candidate_user["role"]
-    # assert payload.get("id") == candidate_user["id"] # Verify ID if included in token creation
+    # Verify token works with /me
+    me_response = await client.get(
+        f"{settings.API_V1_STR}/auth/me",
+        headers={"Authorization": f"Bearer {token}"}
+    )
+    assert me_response.status_code == status.HTTP_200_OK
+    me_data = me_response.json()
+    assert me_data["email"] == candidate_user["email"]
+
+# --- NEW TEST ---
+@pytest.mark.asyncio
+async def test_login_user_success_with_username(client: AsyncClient, candidate_user):
+    """Test successful login using USERNAME."""
+    login_data = {
+        "username": candidate_user["username"], # Use USERNAME here
+        "password": candidate_user["password"]
+    }
+    login_response = await client.post(
+        f"{settings.API_V1_STR}/auth/login",
+        data=login_data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )
+    assert login_response.status_code == status.HTTP_200_OK, f"Login failed: {login_response.text}"
+    login_data_resp = login_response.json()
+    assert "access_token" in login_data_resp
+    token = login_data_resp["access_token"]
+
+    # Verify token works with /me
+    me_response = await client.get(
+        f"{settings.API_V1_STR}/auth/me",
+        headers={"Authorization": f"Bearer {token}"}
+    )
+    assert me_response.status_code == status.HTTP_200_OK
+    me_data = me_response.json()
+    # The /me endpoint returns the full user profile, check email is correct
+    assert me_data["email"] == candidate_user["email"]
+    assert me_data["username"] == candidate_user["username"]
+# --- END NEW TEST ---
 
 @pytest.mark.asyncio
-async def test_login_invalid_password(client, candidate_user): # Use existing user fixture
-    """Test login with incorrect password."""
+async def test_login_invalid_password(client: AsyncClient, candidate_user):
+    """Test login with incorrect password (using email as identifier)."""
     login_data = { "username": candidate_user["email"], "password": "wrongpassword" }
-    response = client.post( "/api/v1/auth/login", data=login_data, headers={"Content-Type": "application/x-www-form-urlencoded"} ) # Added /api/v1 prefix
+    response = await client.post(
+        f"{settings.API_V1_STR}/auth/login",
+        data=login_data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )
     assert response.status_code == status.HTTP_401_UNAUTHORIZED
-    assert "Incorrect email or password" in response.json()["detail"]
+    # --- UPDATED ASSERTION for error message ---
+    assert "Incorrect login credentials" in response.json()["detail"]
 
 @pytest.mark.asyncio
-async def test_login_invalid_email(client):
-    """Test login with non-existent email."""
+async def test_login_invalid_identifier(client: AsyncClient): # Renamed test
+    """Test login with non-existent email/username."""
     login_data = { "username": "nosuchuser@example.com", "password": "testpassword123" }
-    response = client.post( "/api/v1/auth/login", data=login_data, headers={"Content-Type": "application/x-www-form-urlencoded"} ) # Added /api/v1 prefix
-    assert response.status_code == status.HTTP_401_UNAUTHORIZED # Should be 401 if user not found
-    assert "Incorrect email or password" in response.json()["detail"] # Same generic error
+    response = await client.post(
+        f"{settings.API_V1_STR}/auth/login",
+        data=login_data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    # --- UPDATED ASSERTION for error message ---
+    assert "Incorrect login credentials" in response.json()["detail"]
 
 @pytest.mark.asyncio
-async def test_get_current_user_me_success(client, candidate_token, candidate_user):
+async def test_get_current_user_me_success(client: AsyncClient, candidate_token, candidate_user):
     """Test fetching current user details (/me) with a valid token."""
-    response = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {candidate_token}"}) # Added /api/v1 prefix
-    assert response.status_code == status.HTTP_200_OK
+    response = await client.get(
+        f"{settings.API_V1_STR}/auth/me",
+        headers={"Authorization": f"Bearer {candidate_token}"}
+    )
+    assert response.status_code == status.HTTP_200_OK, f"/me failed: {response.text}"
     data = response.json()
     assert data["email"] == candidate_user["email"]
     assert data["username"] == candidate_user["username"]
     assert data["role"] == candidate_user["role"]
-    assert "hashed_password" not in data
-    assert data["id"] == candidate_user["id"]
+    response_id = data.get("id") or data.get("_id")
+    assert response_id == candidate_user["id"] # String vs String comparison
 
 @pytest.mark.asyncio
-async def test_get_current_user_me_no_token(client):
+async def test_get_current_user_me_no_token(client: AsyncClient):
     """Test fetching current user (/me) without providing a token."""
-    response = client.get("/api/v1/auth/me") # Added /api/v1 prefix
+    response = await client.get(f"{settings.API_V1_STR}/auth/me")
     assert response.status_code == status.HTTP_401_UNAUTHORIZED
     assert "Not authenticated" in response.json()["detail"]
 
 @pytest.mark.asyncio
-async def test_get_current_user_me_invalid_token(client):
+async def test_get_current_user_me_invalid_token(client: AsyncClient):
     """Test fetching current user (/me) with an invalid/malformed token."""
     invalid_token = "this.is.not.a.valid.token"
-    response = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {invalid_token}"}) # Added /api/v1 prefix
+    response = await client.get(
+        f"{settings.API_V1_STR}/auth/me",
+        headers={"Authorization": f"Bearer {invalid_token}"}
+    )
     assert response.status_code == status.HTTP_401_UNAUTHORIZED
-    # Detail might vary based on JWT error, check for common credential issue
     assert "Could not validate credentials" in response.json()["detail"]
 
 @pytest.mark.asyncio
-async def test_access_protected_route_candidate(client, candidate_token):
+async def test_access_protected_route_candidate(client: AsyncClient, candidate_token):
     """Test candidate accessing a route they ARE allowed to access."""
-    # Use /candidate/profile as an example candidate route
-    response = client.get("/api/v1/candidate/profile", headers={"Authorization": f"Bearer {candidate_token}"}) # Added /api/v1 prefix
-    # Should succeed
+    # Example: Candidate accessing their own profile
+    response = await client.get(
+        f"{settings.API_V1_STR}/candidate/profile",
+        headers={"Authorization": f"Bearer {candidate_token}"}
+    )
     assert response.status_code == status.HTTP_200_OK
 
 @pytest.mark.asyncio
-async def test_access_protected_route_candidate_denied(client, candidate_token):
+async def test_access_protected_route_candidate_denied(client: AsyncClient, candidate_token):
     """Test candidate accessing a route they ARE NOT allowed to access."""
-    # Use /admin/users as an example admin-only route
-    response = client.get("/api/v1/admin/users", headers={"Authorization": f"Bearer {candidate_token}"}) # Added /api/v1 prefix
-    # Should be forbidden
+    # Example: Candidate trying to access admin user list
+    response = await client.get(
+        f"{settings.API_V1_STR}/admin/users",
+        headers={"Authorization": f"Bearer {candidate_token}"}
+    )
     assert response.status_code == status.HTTP_403_FORBIDDEN

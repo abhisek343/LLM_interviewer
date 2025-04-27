@@ -30,6 +30,9 @@ from app.db.mongodb import mongodb # Use singleton instance
 from app.core.config import settings # Import the settings instance
 from app.services.resume_parser import parse_resume, ResumeParserError
 
+# Import UserOut schema for response models and CandidateProfileUpdate for request body
+from app.schemas.user import UserOut, PyObjectIdStr
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -45,7 +48,7 @@ try:
     logger.info(f"Allowed resume extensions from settings: {ALLOWED_EXTENSIONS}")
 except AttributeError:
     logger.error("Setting 'ALLOWED_RESUME_EXTENSIONS' not found in config.py! Using default.")
-    ALLOWED_EXTENSIONS = {".pdf", ".docx"}
+    ALLOWED_EXTENSIONS = {"pdf", "docx"}
 
 try:
     UPLOAD_DIRECTORY = Path(settings.RESUME_UPLOAD_DIR)
@@ -72,7 +75,7 @@ def get_object_id(id_str: str) -> ObjectId:
 
 # --- Helper Dependency for Candidate Verification ---
 async def require_candidate(current_user: User = Depends(get_current_active_user)):
-    if current_user.role != UserRole.candidate:
+    if current_user.role != "candidate":
         logger.warning(f"Forbidden access attempt by user {current_user.username} (role: {current_user.role}) to Candidate route.")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -83,28 +86,9 @@ async def require_candidate(current_user: User = Depends(get_current_active_user
 
 
 # --- Pydantic Models for Profile ---
-class CandidateProfileOut(BaseModel):
-    id: str = Field(alias="_id")
-    username: str
-    email: EmailStr
-    role: UserRole
-    resume_path: Optional[str] = None
-    created_at: datetime
-
-    class Config:
-        populate_by_name = True
-        # Corrected example schema
-        json_schema_extra = {
-            "example": {
-                "_id": "60d5ecf1b3f8f5a9f3e8e1c1",
-                "username": "candidate_example",
-                "email": "candidate@example.com",
-                "role": "candidate",
-                "resume_path": "/path/to/uploads/resumes/user_id_uuid.pdf",
-                "created_at": "2024-01-01T00:00:00Z"
-            }
-        }
-
+# Define CandidateProfileOut based on UserOut for consistency
+class CandidateProfileOut(UserOut):
+    pass # Inherits fields from UserOut, which already includes needed fields like id, username, email, etc.
 
 class CandidateProfileUpdate(BaseModel):
     username: Optional[str] = Field(None, min_length=3, max_length=50)
@@ -136,16 +120,21 @@ async def upload_resume(
     Handles resume upload for the currently authenticated candidate user.
     Saves file, parses text, updates user record.
     """
-    file_extension = Path(resume.filename).suffix.lower()
-    if file_extension not in ALLOWED_EXTENSIONS:
+    file_extension = Path(resume.filename).suffix.lower() # Keep the dot for comparison if ALLOWED_EXTENSIONS have dots
+
+    # Check if the extension (with dot) is in the allowed set
+    # Adjust comparison based on how ALLOWED_EXTENSIONS is defined (with or without dots)
+    # Assuming ALLOWED_EXTENSIONS contains extensions WITHOUT dots based on config.py
+    if not file_extension or file_extension.lstrip('.') not in ALLOWED_EXTENSIONS:
         logger.error(f"Invalid file type '{file_extension}' from {current_user.username}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid file type. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
+            detail=f"Invalid file type. Allowed: {', '.join(settings.ALLOWED_RESUME_EXTENSIONS)}"
         )
 
     user_id_str = str(current_user.id)
-    safe_filename = f"{user_id_str}_{uuid.uuid4()}{file_extension}"
+    # Generate filename using UUID and original extension
+    safe_filename = f"{user_id_str}_{uuid.uuid4()}{file_extension}" # Re-add extension
     file_location = UPLOAD_DIRECTORY / safe_filename
     parsed_content: Optional[str] = None
     parsing_status = "save pending"
@@ -154,7 +143,6 @@ async def upload_resume(
     try:
         # Use aiofiles for async file operations
         async with aiofiles.open(file_location, "wb") as buffer:
-            # Read file in chunks to avoid memory issues
             while chunk := await resume.read(8192):
                 await buffer.write(chunk)
 
@@ -171,14 +159,18 @@ async def upload_resume(
             else:
                 parsing_status = "parsed empty/unsupported"
                 logger.warning(f"Parsing yielded no content for {file_location}.")
-        except Exception as parse_e:
-            parsing_status = f"parse failed ({type(parse_e).__name__})"
-            logger.error(f"Parsing failed for {file_location}: {parse_e}", exc_info=True)
+        except ResumeParserError as parse_e: # Catch specific parser error
+             parsing_status = f"parse failed ({parse_e})"
+             logger.error(f"Parsing failed for {file_location}: {parse_e}", exc_info=False) # Log less verbosely for expected errors
+        except Exception as parse_e: # Catch unexpected errors
+            parsing_status = f"parse failed (unexpected: {type(parse_e).__name__})"
+            logger.error(f"Unexpected parsing error for {file_location}: {parse_e}", exc_info=True)
 
     except Exception as save_e:
         logger.error(f"Failed to save resume {file_location}: {save_e}", exc_info=True)
         try:
-            file_location.unlink(missing_ok=True)
+            if await aiofiles.os.path.exists(file_location): # Use async exists check
+                 await aiofiles.os.remove(file_location)
         except Exception as unlink_e:
             logger.error(f"Error during cleanup of failed upload {file_location}: {unlink_e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error saving resume file.")
@@ -192,19 +184,29 @@ async def upload_resume(
 
     try:
         users_collection = db[settings.MONGODB_COLLECTION_USERS]
-        user_oid = get_object_id(user_id_str)
+        # --- FIX: Re-fetch user before update ---
+        logger.debug(f"Re-fetching user by email '{current_user.email}' before resume update...")
+        fresh_user_doc = await users_collection.find_one({"email": current_user.email})
+        if not fresh_user_doc:
+            logger.error(f"Authenticated user '{current_user.email}' could not be re-fetched from DB before resume update.")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to re-verify user profile for resume update.")
+        user_oid_to_use = fresh_user_doc["_id"]
+        # --- End FIX ---
+
         update_result = await users_collection.update_one(
-            {"_id": user_oid},
+            {"_id": user_oid_to_use}, # Use the fresh ObjectId
             {"$set": update_data}
         )
 
         if update_result.matched_count == 0:
-            logger.error(f"User {user_id_str} not found during resume path update.")
+            logger.error(f"User {user_id_str} (email: {current_user.email}) not found during resume path update (using fresh ID).")
             try:
-                file_location.unlink(missing_ok=True)
+                 if await aiofiles.os.path.exists(file_location):
+                     await aiofiles.os.remove(file_location)
             except Exception as unlink_e:
                 logger.error(f"Error during cleanup of orphaned upload {file_location}: {unlink_e}")
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User record not found.")
+            # This suggests a major issue if the user authenticated but couldn't be found immediately after
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="User record consistency error during update.")
 
         if update_result.modified_count == 0:
             logger.warning(f"User {user_id_str} resume info update didn't modify doc (perhaps path was the same?).")
@@ -216,7 +218,8 @@ async def upload_resume(
     except Exception as db_e:
         logger.error(f"DB error updating resume info for {current_user.username}: {db_e}", exc_info=True)
         try:
-            file_location.unlink(missing_ok=True)
+            if await aiofiles.os.path.exists(file_location):
+                await aiofiles.os.remove(file_location)
             logger.info(f"Cleaned up {file_location} after DB error.")
         except Exception as unlink_e:
             logger.error(f"Error during cleanup of upload {file_location} after DB error: {unlink_e}")
@@ -224,7 +227,7 @@ async def upload_resume(
 
     return {
         "message": "Resume uploaded successfully",
-        "file_path": str(file_location.resolve()),
+        "file_path": str(file_location.resolve()), # Return resolved path
         "parsing_status": parsing_status
     }
 
@@ -235,20 +238,17 @@ async def get_candidate_profile(
 ):
     """ Retrieves profile information for the currently authenticated candidate. """
     logger.info(f"Fetching profile for candidate: {current_user.username} (ID: {current_user.id})")
-    try:
-        # Convert the User model (which might be slightly different internally)
-        # to the CandidateProfileOut response model.
-        # model_validate handles alias mapping (_id -> id)
-        return CandidateProfileOut.model_validate(current_user)
-    except Exception as e:
-        logger.error(f"Error preparing profile response for user {current_user.username}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Error retrieving profile data.")
+    # The current_user object from the dependency is already validated against UserOut
+    # If CandidateProfileOut is identical to UserOut, we can return directly.
+    # If CandidateProfileOut has different fields/structure, manual mapping or specific validation is needed.
+    # Assuming CandidateProfileOut is effectively the same as UserOut for now:
+    return current_user
 
 
 @router.put("/profile", response_model=CandidateProfileOut)
 async def update_candidate_profile(
     profile_update: CandidateProfileUpdate, # Data to update from request body
-    current_user: User = Depends(require_candidate),
+    current_user: User = Depends(require_candidate), # User model from dependency
     db: AsyncIOMotorClient = Depends(mongodb.get_db)
 ):
     """ Updates profile information for the currently authenticated candidate. """
@@ -271,25 +271,48 @@ async def update_candidate_profile(
     logger.info(f"Update data for user {current_user.username}: {update_data}")
     try:
         users_collection = db[settings.MONGODB_COLLECTION_USERS]
-        user_oid = get_object_id(str(current_user.id))
-        update_result = await users_collection.update_one( {"_id": user_oid}, {"$set": update_data} )
 
+        # --- START FIX/DIAGNOSTIC ---
+        # Re-fetch the user by email to get a guaranteed fresh ObjectId
+        logger.debug(f"Re-fetching user by email '{current_user.email}' before update...")
+        fresh_user_doc = await users_collection.find_one({"email": current_user.email})
+
+        if not fresh_user_doc:
+            # This should not happen if the user was authenticated, but handle defensively
+            logger.error(f"Authenticated user '{current_user.email}' could not be re-fetched from DB before update.")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to re-verify user profile for update.")
+
+        user_oid_to_use = fresh_user_doc["_id"] # Use the ObjectId directly from the fresh document
+        logger.debug(f"Using fresh ObjectId '{user_oid_to_use}' for update query.")
+        # --- END FIX/DIAGNOSTIC ---
+
+        # Perform the update using the freshly fetched ObjectId
+        update_result = await users_collection.update_one(
+            {"_id": user_oid_to_use}, # Use the ObjectId obtained just now
+            {"$set": update_data}
+        )
+
+        # --- The rest of the logic remains the same ---
         if update_result.matched_count == 0:
+             # This should now be much less likely to happen
+             logger.error(f"Update failed: User with fresh ObjectId '{user_oid_to_use}' not matched.")
              raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Candidate profile not found during update.")
+
         if update_result.modified_count == 0:
              logger.info(f"Profile for user {current_user.username} not modified (no changes submitted or data was identical).")
-             # Return current profile if nothing changed
-             updated_user_doc = await users_collection.find_one({"_id": user_oid})
+             # Fetch using the same confirmed ObjectId
+             updated_user_doc = await users_collection.find_one({"_id": user_oid_to_use})
         else:
              logger.info(f"Successfully updated profile for user {current_user.username}.")
-             updated_user_doc = await users_collection.find_one({"_id": user_oid})
+             # Fetch using the same confirmed ObjectId
+             updated_user_doc = await users_collection.find_one({"_id": user_oid_to_use})
 
         if not updated_user_doc:
-            # This should ideally not happen if matched_count was > 0
             logger.error(f"Failed to retrieve updated profile for user {current_user.username} after update operation.")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve updated profile.")
 
         # Use model_validate to create the Pydantic model from the dict
+        # Ensure the response model matches the schema used (CandidateProfileOut)
         return CandidateProfileOut.model_validate(updated_user_doc)
 
     except HTTPException:

@@ -10,6 +10,7 @@ import io
 import shutil
 from pathlib import Path
 from motor.motor_asyncio import AsyncIOMotorClient # Import for type hinting
+from app.schemas.user import UserOut # <--- CORRECTED IMPORT: Use UserOut from user.py
 
 # Fixtures like client, test_users_and_tokens, candidate_token, hr_token, admin_token,
 # candidate_user, hr_user, test_db are provided by conftest.py
@@ -17,29 +18,37 @@ from motor.motor_asyncio import AsyncIOMotorClient # Import for type hinting
 # --- Tests for GET /candidate/profile ---
 
 @pytest.mark.asyncio
-async def test_get_profile_success(client, candidate_token, candidate_user, test_db): # Added test_db
+async def test_get_profile_success(client, candidate_token, candidate_user, test_db):
     """Test candidate successfully fetching their own profile."""
-    response = client.get("/api/v1/candidate/profile", headers={"Authorization": f"Bearer {candidate_token}"})
-    # Assertion depends on test_db fixture providing connection via override
+    response = await client.get("/api/v1/candidate/profile", headers={"Authorization": f"Bearer {candidate_token}"})
     assert response.status_code == status.HTTP_200_OK
-    profile = response.json()
-    assert profile["id"] == candidate_user["id"]
-    assert profile["username"] == candidate_user["username"]
-    assert profile["email"] == candidate_user["email"]
-    assert profile["role"] == "candidate"
-    assert "hashed_password" not in profile
+    profile_raw = response.json()
+
+    # --- FIX: Validate response against the schema ---
+    try:
+        profile_validated = UserOut.model_validate(profile_raw) # <--- Use UserOut for validation
+    except Exception as e:
+        pytest.fail(f"Pydantic validation failed for profile response: {e}\nData: {profile_raw}")
+
+    # --- Assert on the validated Pydantic model instance ---
+    assert hasattr(profile_validated, 'id') # Check the attribute exists
+    assert profile_validated.id == candidate_user["id"] # Compare string ID from fixture
+    assert profile_validated.username == candidate_user["username"]
+    assert profile_validated.email == candidate_user["email"]
+    assert profile_validated.role == "candidate"
+    assert not hasattr(profile_validated, 'hashed_password') # Ensure sensitive data excluded
 
 @pytest.mark.asyncio
 async def test_get_profile_forbidden_hr(client, hr_token, test_db): # Added test_db
     """Test HR cannot access candidate profile endpoint."""
-    response = client.get("/api/v1/candidate/profile", headers={"Authorization": f"Bearer {hr_token}"})
+    response = await client.get("/api/v1/candidate/profile", headers={"Authorization": f"Bearer {hr_token}"})
     # Assertion depends on test_db fixture providing connection via override
     assert response.status_code == status.HTTP_403_FORBIDDEN
 
 @pytest.mark.asyncio
 async def test_get_profile_forbidden_admin(client, admin_token, test_db): # Added test_db
     """Test Admin cannot access candidate profile endpoint."""
-    response = client.get("/api/v1/candidate/profile", headers={"Authorization": f"Bearer {admin_token}"})
+    response = await client.get("/api/v1/candidate/profile", headers={"Authorization": f"Bearer {admin_token}"})
     # Assertion depends on test_db fixture providing connection via override
     assert response.status_code == status.HTTP_403_FORBIDDEN
 
@@ -50,7 +59,7 @@ async def test_update_profile_success(client, candidate_token, candidate_user, t
     """Test candidate successfully updating their profile (username)."""
     update_payload = {"username": "updated_candidate"}
 
-    response = client.put(
+    response = await client.put(
         "/api/v1/candidate/profile",
         json=update_payload,
         headers={"Authorization": f"Bearer {candidate_token}"}
@@ -71,7 +80,7 @@ async def test_update_profile_username_taken(client, candidate_token, hr_user, t
     """Test candidate trying to update username to one that already exists."""
     update_payload = {"username": hr_user["username"]}
 
-    response = client.put(
+    response = await client.put(
         "/api/v1/candidate/profile",
         json=update_payload,
         headers={"Authorization": f"Bearer {candidate_token}"}
@@ -83,7 +92,7 @@ async def test_update_profile_username_taken(client, candidate_token, hr_user, t
 @pytest.mark.asyncio
 async def test_update_profile_no_data(client, candidate_token, test_db): # Added test_db
     """Test sending empty payload for profile update."""
-    response = client.put(
+    response = await client.put(
         "/api/v1/candidate/profile",
         json={},
         headers={"Authorization": f"Bearer {candidate_token}"}
@@ -96,7 +105,7 @@ async def test_update_profile_no_data(client, candidate_token, test_db): # Added
 async def test_update_profile_forbidden_hr(client, hr_token, test_db): # Added test_db
     """Test HR cannot update a candidate's profile via this route."""
     update_payload = {"username": "hr_updated_name"}
-    response = client.put(
+    response = await client.put(
         "/api/v1/candidate/profile",
         json=update_payload,
         headers={"Authorization": f"Bearer {hr_token}"}
@@ -124,7 +133,7 @@ async def test_upload_resume_success(
     file_name = "my_resume.pdf"
     files = {'resume': (file_name, io.BytesIO(file_content), 'application/pdf')}
 
-    response = client.post(
+    response = await client.post(
         "/api/v1/candidate/resume",
         files=files,
         headers={"Authorization": f"Bearer {candidate_token}"}
@@ -155,7 +164,7 @@ async def test_upload_resume_invalid_extension(client, candidate_token, test_db)
     file_name = "my_resume.txt"
     files = {'resume': (file_name, io.BytesIO(file_content), 'text/plain')}
 
-    response = client.post(
+    response = await client.post(
         "/api/v1/candidate/resume",
         files=files,
         headers={"Authorization": f"Bearer {candidate_token}"}
@@ -171,7 +180,7 @@ async def test_upload_resume_forbidden_hr(client, hr_token, test_db): # Added te
     file_name = "hr_resume.pdf"
     files = {'resume': (file_name, io.BytesIO(file_content), 'application/pdf')}
 
-    response = client.post(
+    response = await client.post(
         "/api/v1/candidate/resume",
         files=files,
         headers={"Authorization": f"Bearer {hr_token}"}
@@ -197,7 +206,7 @@ async def test_upload_resume_parser_error(
     file_name = "bad_resume.pdf"
     files = {'resume': (file_name, io.BytesIO(file_content), 'application/pdf')}
 
-    response = client.post(
+    response = await client.post(
         "/api/v1/candidate/resume",
         files=files,
         headers={"Authorization": f"Bearer {candidate_token}"}

@@ -1,7 +1,7 @@
 # LLM_interviewer/server/app/api/routes/admin.py
 
 import logging
-from typing import List
+from typing import List, Dict, Any # Added Dict, Any
 from fastapi import (
     APIRouter,
     Depends,
@@ -14,18 +14,16 @@ from bson import ObjectId
 from bson.errors import InvalidId
 
 # Core, models, schemas, db
-from app.core.security import get_current_active_user
-from app.models.user import User, UserRole
-from app.schemas.user import UserResponse # Import the response schema
+from app.core.security import get_current_active_user, verify_admin_user # Import verify_admin_user
+# from app.models.user import User # Can often be removed if using UserOut from dependency
+from app.schemas.user import UserOut # Import UserOut for response model & dependency type hint
 from app.db.mongodb import mongodb # Use the singleton instance
 from app.core.config import settings # Use the settings instance directly
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --- Helper function to Get ObjectId ---
-# (Duplicating here for self-containment, consider moving to a shared util)
 def get_object_id(id_str: str) -> ObjectId:
     """Converts a string ID to ObjectId, raising HTTPException on failure."""
     try:
@@ -34,32 +32,21 @@ def get_object_id(id_str: str) -> ObjectId:
         logger.error(f"Invalid ObjectId format: '{id_str}'. Error: {e}")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid ID format: {id_str}")
 
-# --- Helper Dependency for Admin Verification ---
-async def verify_admin_user(current_user: User = Depends(get_current_active_user)):
-    """Dependency to check if the current user is an admin."""
-    if current_user.role != UserRole.admin:
-        logger.warning(f"Forbidden attempt to access admin route by user {current_user.username} (role: {current_user.role})")
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Operation not permitted. Administrator privileges required."
-        )
-    return current_user
-
 # --- Router Setup ---
 router = APIRouter(
     prefix="/admin",
     tags=["Admin"],
-    # Apply admin verification to all routes in this router
+    # Apply admin verification dependency correctly using the imported function
     dependencies=[Depends(verify_admin_user)]
 )
 
 # --- Admin Routes ---
 
-@router.get("/users", response_model=List[UserResponse])
+@router.get("/users", response_model=List[UserOut])
 async def get_all_users(
-    admin_user: User = Depends(verify_admin_user), # Explicit dependency for clarity
-    db: AsyncIOMotorClient = Depends(mongodb.get_db) # Use dependency injection
-):
+    admin_user: UserOut = Depends(verify_admin_user), # Type hint dependency as UserOut
+    db: AsyncIOMotorClient = Depends(mongodb.get_db)
+) -> List[UserOut]: # Return list of UserOut models (FastAPI handles serialization)
     """
     Retrieves a list of all registered users. (Admin only)
     """
@@ -68,22 +55,25 @@ async def get_all_users(
     users_cursor = users_collection.find()
     users_list = await users_cursor.to_list(length=None) # Fetch all
 
-    response_users = []
+    response_users_models = []
     for user_doc in users_list:
-        # Ensure _id is converted to string for 'id' field if UserResponse expects 'id'
-        user_doc["id"] = str(user_doc["_id"])
         try:
-            response_users.append(UserResponse(**user_doc))
+            # Validate MongoDB doc into a UserOut Pydantic model instance
+            # Pydantic handles the _id -> id aliasing during validation if schema is correct
+            user_model_instance = UserOut.model_validate(user_doc)
+            response_users_models.append(user_model_instance)
         except Exception as e:
-             logger.error(f"Error parsing user document to UserResponse: {user_doc}. Error: {e}", exc_info=True)
+             logger.error(f"Error parsing user document to UserOut: {user_doc}. Error: {e}", exc_info=True)
              # Optionally skip this user or handle error differently
 
-    logger.info(f"Returning {len(response_users)} users to admin {admin_user.username}.")
-    return response_users
+    logger.info(f"Returning {len(response_users_models)} users to admin {admin_user.username}.")
+    # Return the list of Pydantic model instances directly
+    # FastAPI + response_model should handle serialization and aliasing (_id -> id) correctly now
+    return response_users_models
 
 @router.get("/stats")
 async def get_system_stats(
-    admin_user: User = Depends(verify_admin_user),
+    admin_user: UserOut = Depends(verify_admin_user), # Type hint dependency as UserOut
     db: AsyncIOMotorClient = Depends(mongodb.get_db)
 ):
     """
@@ -112,11 +102,11 @@ async def get_system_stats(
          logger.error(f"Error fetching system stats: {e}", exc_info=True)
          raise HTTPException(status_code=500, detail="Could not retrieve system statistics.")
 
-# --- NEW Endpoint: Delete User ---
+
 @router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_user(
-    user_id: str, # User ID from path parameter
-    admin_user: User = Depends(verify_admin_user), # Ensures requester is admin
+    user_id: str, # User ID from path parameter (string)
+    admin_user: UserOut = Depends(verify_admin_user), # Type hint dependency as UserOut (contains string 'id')
     db: AsyncIOMotorClient = Depends(mongodb.get_db)
 ):
     """
@@ -124,41 +114,49 @@ async def delete_user(
     Prevents an admin from deleting their own account.
     """
     logger.warning(f"Admin {admin_user.username} attempting to delete user ID: {user_id}")
-    user_oid_to_delete = get_object_id(user_id) # Validate and convert ID
 
-    # Prevent admin self-deletion
-    if str(user_oid_to_delete) == str(admin_user.id):
-        logger.error(f"Admin user {admin_user.username} attempted self-deletion.")
+    # --- Self-deletion check ---
+    # admin_user.id comes from UserOut which aliases _id to id (string)
+    # user_id comes from the path parameter (string)
+
+    # Optional: Keep debug log if helpful, remove if not needed for production
+    # logger.debug(f"Self-delete check: Comparing path user_id='{user_id}' (type: {type(user_id)}) with dependency admin_user.id='{admin_user.id}' (type: {type(admin_user.id)})")
+
+    if user_id == admin_user.id: # Direct string comparison
+        logger.error(f"Admin user {admin_user.username} attempted self-deletion (ID: {admin_user.id}). Preventing operation.")
+        # --- Ensure HTTPException is raised for production logic ---
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Administrators cannot delete their own account."
         )
+        # --- Removed temporary diagnostic logger.critical line ---
 
-    # Find user to ensure they exist before deleting
+    # --- END Self-deletion check ---
+
+    # Validate path param and convert to ObjectId for DB operations *after* self-delete check
+    try:
+        user_oid_to_delete = ObjectId(user_id)
+    except (InvalidId, TypeError):
+        logger.error(f"Invalid ObjectId format in path parameter: '{user_id}'")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid user ID format: {user_id}")
+
+
+    # Find user using ObjectId to ensure they exist before deleting
     user_to_delete = await db[settings.MONGODB_COLLECTION_USERS].find_one({"_id": user_oid_to_delete})
     if not user_to_delete:
-        logger.error(f"User with ID {user_id} not found for deletion.")
+        logger.error(f"User with ID {user_id} (ObjectId: {user_oid_to_delete}) not found for deletion.")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"User with ID {user_id} not found."
         )
 
-    # Perform deletion
+    # Perform deletion using ObjectId
     try:
         delete_result = await db[settings.MONGODB_COLLECTION_USERS].delete_one({"_id": user_oid_to_delete})
 
         if delete_result.deleted_count == 1:
-            logger.info(f"Successfully deleted user with ID: {user_id} by admin {admin_user.username}.")
-            # --- Consideration: Data Cascade ---
-            # Should we delete related data? e.g., interviews scheduled BY this user (if HR/Admin)?
-            # Interviews SCHEDULED FOR this user (if candidate)? Candidate responses?
-            # This requires careful planning based on application logic.
-            # For now, we only delete the user document.
-            # Example (Potential Cleanup - USE WITH CAUTION):
-            # if user_to_delete.get("role") == "candidate":
-            #     await db[settings.MONGODB_COLLECTION_INTERVIEWS].delete_many({"candidate_id": user_oid_to_delete})
-            #     await db[settings.MONGODB_COLLECTION_RESPONSES].delete_many({"candidate_id": user_oid_to_delete})
-            # --- End Consideration ---
+            logger.info(f"Successfully deleted user with ID: {user_id} (ObjectId: {user_oid_to_delete}) by admin {admin_user.username}.")
+            # Return 204 No Content
             return Response(status_code=status.HTTP_204_NO_CONTENT)
         else:
             # This case should be rare if find_one succeeded, but handle defensively
@@ -173,5 +171,3 @@ async def delete_user(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An error occurred while deleting the user."
         )
-
-# Add other admin endpoints as needed (e.g., update user role when backend is ready)

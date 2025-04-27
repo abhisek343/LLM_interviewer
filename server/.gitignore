@@ -35,6 +35,21 @@ ENV/
 
 # Logs
 *.log
+*.logs
 
 # MongoDB
 data/ 
+
+uploads/resumes/*
+!uploads/resumes/.gitkeep
+
+docker-compose.yml
+docker-compose.override.yml
+docker-compose*.yml
+
+api_postman.txt
+
+Readme.md
+# Ignore pytest cache
+.pytest_cache/
+pyvenv.cfg

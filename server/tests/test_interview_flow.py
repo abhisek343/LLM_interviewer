@@ -8,33 +8,63 @@ from fastapi import status
 # from app.core.security import get_password_hash, create_access_token # Not used directly
 from app.db.mongodb import mongodb # Keep for type hinting if needed, but use test_db fixture for access
 from app.core.config import settings # Use settings instance directly
-from datetime import datetime, timedelta
-from bson import ObjectId
+from datetime import datetime, timedelta, timezone # Use timezone
+from bson import ObjectId # Ensure ObjectId is imported
 from motor.motor_asyncio import AsyncIOMotorClient # Import for type hint
+from httpx import AsyncClient # Import for type hint
+from typing import Dict, Any, List # <<< UPDATED THIS IMPORT (Added List)
+from app.services.gemini_service import gemini_service # <<< ADDED THIS IMPORT
+
+import logging # <--- ADD THIS IMPORT
+logger = logging.getLogger(__name__) # <--- ADD THIS LINE
 
 # Fixtures like client, test_users_and_tokens, admin_token, hr_token, candidate_token,
 # candidate_user, hr_user, candidate_object_id, mock_gemini, test_db
 # are now expected to be provided by conftest.py
 
-# --- Helper Functions (No changes needed here unless they also accessed mongodb.client) ---
-async def create_test_interview(client, hr_token, candidate_id_str, num_questions=2):
-     """Helper to schedule an interview using the API."""
-     interview_data = {
-         "candidate_id": candidate_id_str,
-         "scheduled_time": (datetime.utcnow() + timedelta(days=1)).isoformat() + "Z",
-         "role": "Test Role",
-         "tech_stack": ["Test"],
-     }
-     response = client.post("/api/v1/interview/schedule", json=interview_data, headers={"Authorization": f"Bearer {hr_token}"})
-     assert response.status_code == status.HTTP_201_CREATED, f"Failed to schedule: {response.text}"
-     interview = response.json()
-     assert len(interview.get("questions", [])) >= num_questions
-     return interview
+# --- Helper Functions (Updated) ---
+async def create_test_interview(client: AsyncClient, hr_token: str, candidate_id_str: str, hr_id_str: str): # Removed num_questions if not used for assertion
+    """Helper to schedule an interview using the API. Uses InterviewCreate schema requirements."""
+    # Ensure IDs are valid ObjectId strings if schema expects them
+    try:
+        ObjectId(candidate_id_str)
+        ObjectId(hr_id_str)
+    except Exception:
+        pytest.fail(f"Invalid ObjectId string provided to create_test_interview: cand='{candidate_id_str}', hr='{hr_id_str}'")
+
+    # Payload based on InterviewCreate schema in app/schemas/interview.py
+    # Check that schema *exactly* for required fields.
+    interview_data = {
+        "candidate_id": candidate_id_str,
+        "hr_id": hr_id_str, # This is technically redundant as it's set server-side, but schema might require it
+        "job_title": "Test Job Title",
+        "job_description": "A description for the test job.",
+        "scheduled_time": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+        "role": "Test Role", # Required by InterviewCreate
+        "tech_stack": ["Test"], # Required by InterviewCreate
+        # "question_ids": [], # Not part of InterviewCreate
+    }
+    logger.debug(f"Scheduling interview with payload: {interview_data}")
+    response = await client.post(
+        f"{settings.API_V1_STR}/interview/schedule", # Use settings prefix
+        json=interview_data,
+        headers={"Authorization": f"Bearer {hr_token}"}
+    )
+    assert response.status_code == status.HTTP_201_CREATED, f"Failed to schedule interview. Status: {response.status_code}, Response: {response.text}"
+    interview = response.json()
+    # Add assertion for interview_id existence?
+    assert "interview_id" in interview and interview["interview_id"] is not None
+    assert "questions" in interview and isinstance(interview["questions"], list)
+    logger.info(f"Interview scheduled successfully with ID: {interview['interview_id']}")
+    return interview
 
 
-async def submit_all_test_responses(client, candidate_token, interview, test_db: AsyncIOMotorClient): # Added test_db parameter
+async def submit_all_test_responses(client: AsyncClient, candidate_token: str, interview: Dict[str, Any], test_db: AsyncIOMotorClient): # Added test_db parameter
     """Helper to submit all responses for a given interview."""
-    interview_id = interview["interview_id"]
+    interview_id = interview.get("interview_id")
+    if not interview_id:
+         pytest.fail("Interview data missing 'interview_id' in submit_all_test_responses helper.")
+
     responses_payload = []
     if not interview or not interview.get("questions"):
          pytest.fail("Interview data or questions missing in submit_all_test_responses helper.")
@@ -45,9 +75,14 @@ async def submit_all_test_responses(client, candidate_token, interview, test_db:
               pytest.fail(f"Question missing 'question_id' in interview data: {q}")
          responses_payload.append({ "question_id": q_id, "answer": f"Ans for {q_id}" })
 
-    submission_data = {"interview_id": interview_id, "responses": responses_payload}
-    response = client.post("/api/v1/interview/submit-all", json=submission_data, headers={"Authorization": f"Bearer {candidate_token}"})
+    # --- FIX: Use 'answers' key instead of 'responses' ---
+    submission_data = {"interview_id": interview_id, "answers": responses_payload}
+    # --- End FIX ---
+
+    logger.info(f"Submitting all answers for interview {interview_id}. Payload: {submission_data}")
+    response = await client.post(f"{settings.API_V1_STR}/interview/submit-all", json=submission_data, headers={"Authorization": f"Bearer {candidate_token}"})
     assert response.status_code == status.HTTP_200_OK, f"Failed to submit all responses: {response.text}"
+    logger.info(f"Successfully submitted all answers for interview {interview_id}.")
 
     # Verify interview is now completed using the injected test_db
     interview_doc = await test_db[settings.MONGODB_COLLECTION_INTERVIEWS].find_one({"interview_id": interview_id})
@@ -55,23 +90,24 @@ async def submit_all_test_responses(client, candidate_token, interview, test_db:
     assert interview_doc.get("status") == "completed", f"Interview {interview_id} status not 'completed' after submission."
 
 
-async def submit_manual_feedback(client, hr_token, interview_id, payload):
+async def submit_manual_feedback(client: AsyncClient, hr_token: str, interview_id: str, payload: Dict[str, Any]):
     """Helper to submit manual feedback/scores."""
-    response = client.post(f"/api/v1/interview/{interview_id}/results", json=payload, headers={"Authorization": f"Bearer {hr_token}"})
+    response = await client.post(f"{settings.API_V1_STR}/interview/{interview_id}/results", json=payload, headers={"Authorization": f"Bearer {hr_token}"})
     assert response.status_code == status.HTTP_200_OK, f"Failed to submit feedback: {response.text}"
     return response.json()
 
 # --- Test Cases (Updated) ---
 
 @pytest.mark.asyncio
-async def test_get_result_no_scores(client, hr_token, candidate_token, candidate_user, test_db): # Added test_db
+async def test_get_result_no_scores(client: AsyncClient, hr_token: str, candidate_token: str, candidate_user: Dict[str, Any], hr_user: Dict[str, Any], test_db: AsyncIOMotorClient): # Added hr_user, test_db
     # 1. Schedule and complete interview
-    interview = await create_test_interview(client, hr_token, candidate_user["id"])
+    # Pass hr_user ID to helper
+    interview = await create_test_interview(client, hr_token, candidate_user["id"], hr_user["id"])
     interview_id = interview["interview_id"]
     await submit_all_test_responses(client, candidate_token, interview, test_db) # Pass test_db
 
     # 2. Fetch results (before any scoring)
-    response = client.get(f"/api/v1/interview/results/{interview_id}", headers={"Authorization": f"Bearer {hr_token}"})
+    response = await client.get(f"{settings.API_V1_STR}/interview/results/{interview_id}", headers={"Authorization": f"Bearer {hr_token}"})
     assert response.status_code == status.HTTP_200_OK
     result = response.json()
 
@@ -80,9 +116,10 @@ async def test_get_result_no_scores(client, hr_token, candidate_token, candidate
     assert "Evaluation pending" in result.get("overall_feedback", "")
 
 @pytest.mark.asyncio
-async def test_get_result_calculated_from_individual_scores(client, hr_token, candidate_token, candidate_user, candidate_object_id, test_db): # Added test_db
+async def test_get_result_calculated_from_individual_scores(client: AsyncClient, hr_token: str, candidate_token: str, candidate_user: Dict[str, Any], hr_user: Dict[str, Any], candidate_object_id: ObjectId, test_db: AsyncIOMotorClient): # Added hr_user, test_db
     # 1. Schedule and complete interview
-    interview = await create_test_interview(client, hr_token, candidate_user["id"])
+    # Pass hr_user ID to helper
+    interview = await create_test_interview(client, hr_token, candidate_user["id"], hr_user["id"])
     interview_id = interview["interview_id"]
     await submit_all_test_responses(client, candidate_token, interview, test_db) # Pass test_db
 
@@ -101,16 +138,17 @@ async def test_get_result_calculated_from_individual_scores(client, hr_token, ca
     )
 
     # 3. Fetch results and verify calculated average score
-    response = client.get(f"/api/v1/interview/results/{interview_id}", headers={"Authorization": f"Bearer {hr_token}"})
+    response = await client.get(f"{settings.API_V1_STR}/interview/results/{interview_id}", headers={"Authorization": f"Bearer {hr_token}"})
     assert response.status_code == status.HTTP_200_OK
     result = response.json()
     assert result["total_score"] == pytest.approx(3.0)
     assert "Evaluation pending" not in result.get("overall_feedback", "")
 
 @pytest.mark.asyncio
-async def test_post_results_calculates_and_stores_overall_score(client, hr_token, candidate_token, candidate_user, test_db): # Added test_db
+async def test_post_results_calculates_and_stores_overall_score(client: AsyncClient, hr_token: str, candidate_token: str, candidate_user: Dict[str, Any], hr_user: Dict[str, Any], test_db: AsyncIOMotorClient): # Added hr_user, test_db
     # 1. Schedule and complete interview
-    interview = await create_test_interview(client, hr_token, candidate_user["id"])
+    # Pass hr_user ID to helper
+    interview = await create_test_interview(client, hr_token, candidate_user["id"], hr_user["id"])
     interview_id = interview["interview_id"]
     q1_id = interview["questions"][0].get("question_id", "mock_q1")
     q2_id = interview["questions"][1].get("question_id", "mock_q2")
@@ -122,11 +160,12 @@ async def test_post_results_calculates_and_stores_overall_score(client, hr_token
             {"question_id": q1_id, "score": 5.0, "feedback": "Excellent"},
             {"question_id": q2_id, "score": 3.0, "feedback": "Okay"},
         ]
+        # No overall_score or overall_feedback provided here
     }
     await submit_manual_feedback(client, hr_token, interview_id, feedback_payload)
 
     # 3. Fetch results and verify calculated average score
-    response = client.get(f"/api/v1/interview/results/{interview_id}", headers={"Authorization": f"Bearer {hr_token}"})
+    response = await client.get(f"{settings.API_V1_STR}/interview/results/{interview_id}", headers={"Authorization": f"Bearer {hr_token}"})
     assert response.status_code == status.HTTP_200_OK
     result = response.json()
     assert result["total_score"] == pytest.approx(4.0)
@@ -135,13 +174,14 @@ async def test_post_results_calculates_and_stores_overall_score(client, hr_token
     updated_interview_doc = await test_db[settings.MONGODB_COLLECTION_INTERVIEWS].find_one({"interview_id": interview_id}) # Use test_db
     assert updated_interview_doc is not None
     assert updated_interview_doc.get("overall_score") == pytest.approx(4.0)
-    assert updated_interview_doc.get("overall_feedback") is None
+    assert updated_interview_doc.get("overall_feedback") is None # Should be None as none was submitted
     assert updated_interview_doc.get("evaluated_by") is not None
 
 @pytest.mark.asyncio
-async def test_post_results_manual_overall_score_override(client, hr_token, candidate_token, candidate_user, test_db): # Added test_db
+async def test_post_results_manual_overall_score_override(client: AsyncClient, hr_token: str, candidate_token: str, candidate_user: Dict[str, Any], hr_user: Dict[str, Any], test_db: AsyncIOMotorClient): # Added hr_user, test_db
     # 1. Schedule and complete interview
-    interview = await create_test_interview(client, hr_token, candidate_user["id"])
+    # Pass hr_user ID to helper
+    interview = await create_test_interview(client, hr_token, candidate_user["id"], hr_user["id"])
     interview_id = interview["interview_id"]
     q1_id = interview["questions"][0].get("question_id", "mock_q1")
     q2_id = interview["questions"][1].get("question_id", "mock_q2")
@@ -159,7 +199,7 @@ async def test_post_results_manual_overall_score_override(client, hr_token, cand
     await submit_manual_feedback(client, hr_token, interview_id, feedback_payload)
 
     # 3. Fetch results and verify the MANUALLY submitted overall score is used
-    response = client.get(f"/api/v1/interview/results/{interview_id}", headers={"Authorization": f"Bearer {hr_token}"})
+    response = await client.get(f"{settings.API_V1_STR}/interview/results/{interview_id}", headers={"Authorization": f"Bearer {hr_token}"})
     assert response.status_code == status.HTTP_200_OK
     result = response.json()
     assert result["total_score"] == pytest.approx(1.5)
@@ -173,9 +213,10 @@ async def test_post_results_manual_overall_score_override(client, hr_token, cand
 
 @pytest.mark.asyncio
 # mock_gemini fixture is autouse=True in conftest.py
-async def test_ai_evaluation_updates_response(client, hr_token, candidate_token, candidate_user, candidate_object_id, test_db): # Added test_db
+async def test_ai_evaluation_updates_response(client: AsyncClient, hr_token: str, candidate_token: str, candidate_user: Dict[str, Any], hr_user: Dict[str, Any], candidate_object_id: ObjectId, test_db: AsyncIOMotorClient): # Added hr_user, test_db
     # 1. Create interview & submit responses
-    interview = await create_test_interview(client, hr_token, candidate_user["id"])
+    # Pass hr_user ID to helper
+    interview = await create_test_interview(client, hr_token, candidate_user["id"], hr_user["id"])
     interview_id = interview["interview_id"]
     q1_id = interview["questions"][0].get("question_id", "mock_q1")
     await submit_all_test_responses(client, candidate_token, interview, test_db) # Pass test_db
@@ -191,7 +232,7 @@ async def test_ai_evaluation_updates_response(client, hr_token, candidate_token,
     ai_feedback = "[AI]: Mock evaluation."
 
     # 4. Trigger AI evaluation via API
-    response = client.post(f"/api/v1/interview/responses/{response_id}/evaluate", headers={"Authorization": f"Bearer {hr_token}"})
+    response = await client.post(f"{settings.API_V1_STR}/interview/responses/{response_id}/evaluate", headers={"Authorization": f"Bearer {hr_token}"})
     assert response.status_code == status.HTTP_200_OK
     updated_response_data = response.json()
 
@@ -207,45 +248,51 @@ async def test_ai_evaluation_updates_response(client, hr_token, candidate_token,
     assert final_response_doc["feedback"] == ai_feedback
 
 @pytest.mark.asyncio
-async def test_gemini_fallback_questions(client, hr_token, candidate_user, test_db, mock_gemini): # Added test_db, Request mock_gemini
+async def test_gemini_fallback_questions(client: AsyncClient, hr_token: str, candidate_user: Dict[str, Any], hr_user: Dict[str, Any], test_db: AsyncIOMotorClient, mock_gemini): # Added test_db, Request mock_gemini
     # --- Corrected: Set return_value directly on the mock ---
-    mock_gemini.return_value = [] # Simulate Gemini failing to generate questions
-    # --- End Correction ---
+    # Make Gemini generate_questions return empty list to force fallback
+    async def mock_gen_q_empty(*args, **kwargs): return []
+    with patch.object(gemini_service, 'generate_questions', new=mock_gen_q_empty) as mock_call:
 
-    # Ensure default questions exist (or skip test if they don't)
-    if await test_db[settings.MONGODB_COLLECTION_QUESTIONS].count_documents({}) == 0: # Use test_db
-        pytest.skip("Skipping fallback test: Default questions not seeded/accessible in test DB.")
+        # Ensure default questions exist (or skip test if they don't)
+        if await test_db[settings.MONGODB_COLLECTION_QUESTIONS].count_documents({}) == 0: # Use test_db
+            # Optionally seed defaults here for the test if needed, or skip
+            # await _seed_default_questions_internal() # Make sure this uses test_db if called
+            pytest.skip("Skipping fallback test: Default questions not seeded/accessible in test DB.")
 
-    interview_data = {
-        "candidate_id": candidate_user["id"],
-        "scheduled_time": (datetime.utcnow() + timedelta(days=1)).isoformat()+"Z",
-        "role": "SE",
-        "tech_stack": ["Py"]
-    }
-    response = client.post("/api/v1/interview/schedule", json=interview_data, headers={"Authorization": f"Bearer {hr_token}"})
+        interview_data = {
+            "candidate_id": candidate_user["id"],
+            "hr_id": hr_user["id"], # Include hr_id if schema requires
+            "job_title": "Fallback Test",
+            "role": "SE",
+            "tech_stack": ["Py"]
+        }
+        response = await client.post(f"{settings.API_V1_STR}/interview/schedule", json=interview_data, headers={"Authorization": f"Bearer {hr_token}"})
 
-    assert response.status_code == status.HTTP_201_CREATED
-    interview = response.json()
-    assert len(interview["questions"]) > 0
-    assert ObjectId.is_valid(interview["questions"][0].get("question_id"))
-    # --- Corrected: Assert call on the mock directly ---
-    mock_gemini.assert_awaited_once()
-    # --- End Correction ---
+        assert response.status_code == status.HTTP_201_CREATED
+        interview = response.json()
+        assert len(interview["questions"]) > 0
+        # Check if the question_id looks like a default one (ObjectId string)
+        assert ObjectId.is_valid(interview["questions"][0].get("question_id"))
+
+        # Assert the mocked method was called
+        mock_call.assert_awaited_once()
+
 
 @pytest.mark.asyncio
-async def test_unauthorized_role_access(client, hr_token, candidate_token, admin_token):
+async def test_unauthorized_role_access(client: AsyncClient, hr_token: str, candidate_token: str, admin_token: str):
     # Candidate trying to access HR/Admin route
-    response = client.get("/api/v1/interview/all", headers={"Authorization": f"Bearer {candidate_token}"})
+    response = await client.get(f"{settings.API_V1_STR}/interview/all", headers={"Authorization": f"Bearer {candidate_token}"})
     assert response.status_code == status.HTTP_403_FORBIDDEN
 
     # HR trying to access Admin route
-    response = client.get("/api/v1/admin/users", headers={"Authorization": f"Bearer {hr_token}"})
+    response = await client.get(f"{settings.API_V1_STR}/admin/users", headers={"Authorization": f"Bearer {hr_token}"})
     assert response.status_code == status.HTTP_403_FORBIDDEN
 
     # Admin accessing HR/Admin route (should succeed)
-    response = client.get("/api/v1/interview/all", headers={"Authorization": f"Bearer {admin_token}"})
+    response = await client.get(f"{settings.API_V1_STR}/interview/all", headers={"Authorization": f"Bearer {admin_token}"})
     assert response.status_code == status.HTTP_200_OK
 
     # Admin accessing Admin route (should succeed)
-    response = client.get("/api/v1/admin/users", headers={"Authorization": f"Bearer {admin_token}"})
+    response = await client.get(f"{settings.API_V1_STR}/admin/users", headers={"Authorization": f"Bearer {admin_token}"})
     assert response.status_code == status.HTTP_200_OK

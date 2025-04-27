@@ -1,208 +1,234 @@
 # LLM_interviewer/server/app/services/gemini_service.py
 
 import google.generativeai as genai
-from app.core.config import get_settings
-from typing import List, Dict, Optional, Any
-import json
 import logging
+import json
 import re
-from datetime import datetime
-from uuid import uuid4
+# *** Ensure this import line includes Optional ***
+from typing import List, Dict, Any, Optional, Tuple
 
-settings = get_settings()
+# Import settings for API key
+from app.core.config import settings
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Import schemas for type hinting return values (Ensure this path is correct)
+try:
+    # Assuming Question schema is in interview.py based on previous context
+    from app.schemas.interview import Question
+except ImportError:
+    # Fallback or define a placeholder if schema isn't strictly needed for service logic
+    Question = Dict[str, Any] # Use a dictionary as a fallback type hint
+
+# Ensure logger is defined for this module
 logger = logging.getLogger(__name__)
 
-# --- Gemini API Configuration ---
-if not settings.GEMINI_API_KEY:
-    logger.warning("GEMINI_API_KEY not found in settings. GeminiService will not function.")
-else:
-    try:
-        genai.configure(api_key=settings.GEMINI_API_KEY)
-    except Exception as e:
-        logger.error(f"Failed to configure Google AI client: {e}", exc_info=True)
+# --- Custom Exception Definition ---
+class GeminiServiceError(Exception):
+    """Custom exception for errors related to the Gemini Service."""
+    def __init__(self, message="An error occurred in the Gemini service", status_code=500):
+        self.message = message
+        self.status_code = status_code
+        super().__init__(self.message)
+
 
 class GeminiService:
     def __init__(self):
-        self.model_name = 'gemini-pro'
+        self.api_key = settings.GEMINI_API_KEY
         self.model = None
+
+        # --- ADDED TEMPORARY DEBUG LOGGING ---
+        if self.api_key:
+            # Log only the first 5 and last 4 characters for security
+            log_key_display = f"{self.api_key[:5]}...{self.api_key[-4:]}"
+            logger.info(f"--- DEBUG: GeminiService attempting to configure with API Key: {log_key_display} ---")
+        else:
+            logger.info("--- DEBUG: GeminiService initialized with NO API Key from settings. ---")
+        # --- END TEMPORARY DEBUG LOGGING ---
+
+        if not self.api_key:
+            logger.critical("CRITICAL: GEMINI_API_KEY is not set. GeminiService cannot be initialized.")
+        else:
+            try:
+                genai.configure(api_key=self.api_key)
+                self.model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
+                logger.info(f"GeminiService initialized successfully with model: {settings.GEMINI_MODEL_NAME}")
+            except Exception as e:
+                logger.error(f"Failed to configure or initialize Gemini model: {e}", exc_info=True)
+                self.model = None
+                logger.critical("Gemini model initialization failed. Service methods requiring the model will not work.")
+
+    def _check_model(self):
+        """Internal helper to check if the model was initialized."""
+        if self.model is None:
+            logger.error("Gemini model is not available (check API key and initialization logs).")
+            raise GeminiServiceError("Gemini model is not configured or initialization failed.", status_code=503)
+
+    async def _call_gemini_api(self, prompt: str) -> Optional[str]:
+        """Helper method to call the Gemini API and handle basic errors."""
+        self._check_model()
         try:
-            if not settings.GEMINI_API_KEY:
-                logger.warning("GEMINI_API_KEY not found. GeminiService will not function.")
-                return
-                
-            self.model = genai.GenerativeModel(self.model_name)
-            logger.info(f"GeminiService initialized with model: {self.model_name}")
-        except Exception as e:
-            logger.error(f"Failed to initialize GenerativeModel '{self.model_name}': {e}", exc_info=True)
-            self.model = None
+            logger.debug(f"Sending prompt to Gemini (first 100 chars): {prompt[:100]}...")
+            response = await self.model.generate_content_async(
+                prompt,
+                generation_config=settings.GEMINI_GENERATION_CONFIG,
+                safety_settings=settings.GEMINI_SAFETY_SETTINGS
+            )
+
+            # Simplified check focusing on accessing text safely
+            if hasattr(response, 'text'):
+                 logger.debug("Received response text from Gemini.")
+                 return response.text
+            elif response.prompt_feedback and response.prompt_feedback.block_reason:
+                 block_reason = response.prompt_feedback.block_reason
+                 logger.warning(f"Gemini request blocked. Reason: {block_reason}")
+                 raise GeminiServiceError(f"Content generation blocked due to safety settings ({block_reason}).", status_code=400)
+            else:
+                 # If no text and no explicit block reason, it's an unexpected empty response
+                 logger.warning("Gemini response received but contained no text content and no block reason.")
+                 raise GeminiServiceError("Gemini returned an unexpected empty response.", status_code=502)
+
+        except GeminiServiceError: # Re-raise custom errors
+            raise
+        except Exception as e: # Catch other potential API errors
+            logger.error(f"Error calling Gemini API: {e}", exc_info=True)
+            # Include specific error details if available (e.g., from google.api_core.exceptions)
+            error_detail = str(e)
+            raise GeminiServiceError(f"Failed to get response from Gemini API: {error_detail}", status_code=502)
+
+
+    def _clean_json_response(self, raw_text: Optional[str]) -> Optional[Any]:
+        """Attempts to extract and parse JSON from the model's text response."""
+        if not raw_text:
+            logger.warning("Received empty text for JSON cleaning.")
+            return None
+
+        logger.debug("Attempting to clean and parse JSON response...")
+        text_to_parse = raw_text.strip()
+        # Regex to find JSON block within ```json ... ``` or ``` ... ```, or a plain JSON object/array
+        match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```|({.*?}|\[.*?\])", text_to_parse, re.DOTALL)
+        json_str_to_parse = None
+        if match:
+            # Prioritize content within backticks if both are found (group 1), else use plain object/array (group 2)
+            json_str_to_parse = match.group(1) if match.group(1) else match.group(2)
+        else:
+            logger.debug("No clear JSON block/object/array found via regex, attempting to parse entire text.")
+            json_str_to_parse = text_to_parse # Fallback to parsing the whole string
+
+        if json_str_to_parse:
+            json_str_to_parse = json_str_to_parse.strip()
+            logger.debug(f"Attempting JSON parsing on: {json_str_to_parse[:200]}...")
+            try:
+                parsed_json = json.loads(json_str_to_parse)
+                logger.debug("Successfully parsed JSON.")
+                return parsed_json
+            except json.JSONDecodeError as e:
+                logger.error(f"JSONDecodeError parsing extracted string: {e}. String was: '{json_str_to_parse[:200]}...'")
+                # Consider trying more aggressive cleaning here if needed
+                return None
+        else:
+            logger.warning("Could not extract a potential JSON string to parse.")
+            return None
+
 
     async def generate_questions(
         self,
-        role: str,
-        tech_stack: List[str],
+        job_title: str,
+        job_description: Optional[str], # Allow job_description to be optional
         num_questions: int = 5,
+        category: str = "General",
+        difficulty: str = "Medium",
         resume_text: Optional[str] = None
-    ) -> List[Dict]:
-        """Generates interview questions, optionally using resume context."""
-        if not self.model:
-            logger.error("Cannot generate questions: Gemini model not initialized.")
-            return []
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        Generates interview questions. Returns list or raises GeminiServiceError.
+        """
+        prompt = f"""
+        Generate {num_questions} interview questions suitable for a candidate applying for the role of '{job_title}'.
+        """
+        if job_description: # Only include if provided
+             prompt += f"Job Description: {job_description}\n"
+        prompt += f"Focus on the category: '{category}' and target difficulty: '{difficulty}'."
+
+        if resume_text:
+            prompt += f"\nConsider the candidate's resume for tailoring questions:\n--- RESUME ---\n{resume_text}\n--- END RESUME ---"
+
+        prompt += f"""
+        Return the questions strictly as a JSON list, where each object has keys: 'text' (string), 'category' (string, should be '{category}'), and 'difficulty' (string, should be '{difficulty}').
+        Example format:
+        [
+          {{"text": "Can you describe your experience with...", "category": "{category}", "difficulty": "{difficulty}"}},
+          {{"text": "How would you approach a situation where...", "category": "{category}", "difficulty": "{difficulty}"}}
+        ]
+        Ensure the output is ONLY the JSON list, without any introductory text or markdown formatting outside the JSON itself.
+        """
         try:
-            prompt_lines = [
-                f"Generate {num_questions} technical interview questions suitable for a candidate applying for a '{role}' position.",
-                f"The key technologies for this role are: {', '.join(tech_stack)}."
-            ]
-            if resume_text and resume_text.strip():
-                logger.info(f"Including resume context in prompt for role '{role}'.")
-                prompt_lines.extend([
-                    "\nConsider the following candidate resume information when tailoring the questions:",
-                    "--- Resume Start ---",
-                    resume_text.strip(),
-                    "--- Resume End ---\n",
-                    "Tailor the questions based on the candidate's experience and skills mentioned in the resume, while still covering the key technologies."
-                ])
+            raw_response_text = await self._call_gemini_api(prompt)
+            parsed_json = self._clean_json_response(raw_response_text)
+
+            if isinstance(parsed_json, list):
+                 logger.info(f"Successfully generated and parsed {len(parsed_json)} questions.")
+                 # Optional: Validate structure of each dict in the list here
+                 return parsed_json
             else:
-                logger.info(f"No resume context provided for prompt for role '{role}'.")
+                 logger.error(f"Parsed JSON response was not a list as expected. Type: {type(parsed_json)}. Raw Text: {raw_response_text[:200]}...")
+                 raise GeminiServiceError("Failed to parse valid JSON list from Gemini response.")
 
-            prompt_lines.extend([
-                "\nFor each question, please provide:",
-                "1. The question text.",
-                "2. A relevant category (e.g., 'Python', 'React', 'System Design', 'Behavioral', 'Databases').",
-                "3. A difficulty level ('Easy', 'Medium', 'Hard').",
-                "\nFormat the entire response strictly as a JSON array of objects. Each object must have exactly these keys: 'text', 'category', 'difficulty'.",
-                "Example format: [{'text': '...', 'category': '...', 'difficulty': '...'}, ...]"
-            ])
-            final_prompt = "\n".join(prompt_lines)
-            logger.debug(f"Gemini Prompt:\n{final_prompt}")
-
-            response = await self.model.generate_content_async(
-                final_prompt,
-                request_options={"timeout": 90}
-            )
-            logger.debug(f"Gemini Raw Response (Questions): {response}")
-            if not response or not hasattr(response, 'text') or not response.text:
-                logger.warning("Gemini API (Questions) returned an empty or invalid response.")
-                return []
-
-            try:
-                cleaned_text = self._clean_json_response(response.text)
-                questions = json.loads(cleaned_text)
-                if not isinstance(questions, list):
-                    logger.warning(f"Gemini API response (Questions) parsed but is not a list. Parsed data: {questions}")
-                    return []
-                
-                # Add required fields for QuestionOut schema
-                validated_questions = []
-                for q in questions:
-                    if isinstance(q, dict) and all(k in q for k in ['text', 'category', 'difficulty']):
-                        q['question_id'] = str(uuid4())
-                        q['created_at'] = datetime.utcnow().isoformat()
-                        validated_questions.append(q)
-                
-                if not validated_questions:
-                    logger.warning(f"Gemini API response (Questions) parsed as list, but no valid question objects found. Response text: {response.text}")
-                    return []
-                
-                logger.info(f"Successfully parsed {len(validated_questions)} questions from Gemini response.")
-                return validated_questions[:num_questions]
-            except json.JSONDecodeError as json_err:
-                logger.warning(f"Gemini API response (Questions) could not be parsed as JSON. Error: {json_err}. Response text: {response.text}")
-                return []
+        except GeminiServiceError:
+            raise
         except Exception as e:
-            logger.error(f"Error generating questions with Gemini: {e}", exc_info=True)
-            return []
+            logger.error(f"Unexpected error during question generation: {e}", exc_info=True)
+            raise GeminiServiceError(f"An unexpected error occurred: {e}")
+
 
     async def evaluate_answer(
         self,
         question_text: str,
-        answer_text: str
+        answer_text: str,
+        job_title: Optional[str] = None,
+        job_description: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         """
-        Evaluates a candidate's answer to a specific question using the Gemini API.
+        Evaluates an answer. Returns dict or raises ValueError/GeminiServiceError.
         """
-        if not self.model:
-            logger.error("Cannot evaluate answer: Gemini model not initialized.")
-            return None
-
         if not question_text or not answer_text:
-            logger.warning("Cannot evaluate answer: Missing question or answer text.")
-            raise ValueError("Question and answer text cannot be empty")
+             logger.warning("evaluate_answer called with missing question or answer text.")
+             raise ValueError("Question text and answer text cannot be empty.")
 
+        prompt = f"""
+        Evaluate the following answer provided by a candidate for the interview question:
+        Question: "{question_text}"
+        Candidate's Answer: "{answer_text}"
+        """
+        if job_title:
+            prompt += f"\nThe candidate is applying for the role of: '{job_title}'."
+        if job_description:
+            prompt += f"\nConsider the following job description context:\n{job_description}"
+
+        prompt += """
+        Provide an evaluation score between 0.0 and 5.0 (float, where 5.0 is excellent) and concise feedback (string).
+        Return the evaluation strictly as a JSON object with keys: 'score' (float) and 'feedback' (string).
+        Example format:
+        {"score": 4.0, "feedback": "The candidate demonstrated strong understanding..."}
+        Ensure the output is ONLY the JSON object, without any introductory text or markdown formatting.
+        """
         try:
-            prompt = f"""
-            Act as an expert technical interviewer evaluating a candidate's response.
-            Evaluate the following answer based *only* on the provided question and answer text.
-            Consider correctness, completeness, clarity, and relevance to the question.
+            raw_response_text = await self._call_gemini_api(prompt)
+            parsed_json = self._clean_json_response(raw_response_text)
 
-            **Question:**
-            {question_text}
+            if isinstance(parsed_json, dict) and 'score' in parsed_json and 'feedback' in parsed_json:
+                 logger.info("Successfully evaluated answer and parsed response.")
+                 # Optional: Validate score range/type and feedback type here
+                 return parsed_json
+            else:
+                 logger.error(f"Parsed JSON response was not a valid evaluation dict. Content: {parsed_json}. Raw Text: {raw_response_text[:200]}...")
+                 raise GeminiServiceError("Failed to parse valid evaluation JSON from Gemini response.")
 
-            **Candidate's Answer:**
-            {answer_text}
-
-            **Evaluation Task:**
-            1. Provide a numerical score between 0.0 and 5.0 (inclusive), where 0 indicates completely incorrect/irrelevant and 5 indicates a perfect answer. Use decimal points if appropriate (e.g., 3.5).
-            2. Provide brief, constructive feedback (1-3 sentences) explaining the reasoning for the score. Focus on strengths and areas for improvement based *solely* on the given answer's content in relation to the question. Do not add information not present in the answer.
-
-            **Output Format:**
-            Return your evaluation strictly as a JSON object with exactly two keys:
-            - "score": float (numerical score between 0.0 and 5.0)
-            - "feedback": string (brief textual feedback)
-
-            Example JSON output: {{"score": 4.0, "feedback": "Correctly identifies the main concept but lacks detail on edge cases."}}
-            """
-            logger.debug(f"Gemini Evaluation Prompt:\n{prompt}")
-
-            response = await self.model.generate_content_async(
-                prompt,
-                request_options={"timeout": 60}
-            )
-            logger.debug(f"Gemini Raw Response (Evaluation): {response}")
-
-            if not response or not hasattr(response, 'text') or not response.text:
-                logger.warning("Gemini API (Evaluation) returned an empty or invalid response object or text.")
-                if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
-                    logger.warning(f"Gemini prompt feedback: {response.prompt_feedback}")
-                return None
-
-            try:
-                cleaned_text = self._clean_json_response(response.text)
-                evaluation = json.loads(cleaned_text)
-
-                if not isinstance(evaluation, dict) or 'score' not in evaluation or 'feedback' not in evaluation:
-                    logger.warning(f"Gemini API response (Evaluation) parsed but not in expected dict format with 'score' and 'feedback'. Parsed: {evaluation}")
-                    return None
-
-                score = evaluation.get('score')
-                feedback = evaluation.get('feedback', '')
-
-                if not isinstance(score, (int, float)) or not 0.0 <= score <= 5.0:
-                    logger.warning(f"Invalid score in evaluation: {score}")
-                    return None
-
-                logger.info(f"Successfully evaluated answer. Score: {score}, Feedback: {feedback[:100]}...")
-                return {"score": float(score), "feedback": feedback.strip()}
-
-            except json.JSONDecodeError as json_err:
-                logger.warning(f"Gemini API response (Evaluation) could not be parsed as JSON. Error: {json_err}. Response text: {response.text}")
-                return None
-
+        except GeminiServiceError:
+             raise
+        except ValueError: # Re-raise ValueError from input check
+             raise
         except Exception as e:
-            logger.error(f"Error evaluating answer with Gemini: {e}", exc_info=True)
-            return None
+             logger.error(f"Unexpected error during answer evaluation: {e}", exc_info=True)
+             raise GeminiServiceError(f"An unexpected error occurred: {e}")
 
-    def _clean_json_response(self, text: str) -> str:
-        """Removes potential markdown fences and leading/trailing whitespace."""
-        # Remove triple backticks and optional 'json' language identifier
-        cleaned = re.sub(r"^\s*```(json)?\s*", "", text, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s*```\s*$", "", cleaned)
-        # Remove any text before or after the JSON
-        cleaned = re.sub(r"^.*?(\{.*\}).*$", r"\1", cleaned, flags=re.DOTALL)
-        # Strip leading/trailing whitespace
-        return cleaned.strip()
-
-# Instantiate the service
+# Create a single instance for the application to use
 gemini_service = GeminiService()

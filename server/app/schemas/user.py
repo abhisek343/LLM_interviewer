@@ -1,74 +1,91 @@
 # LLM_interviewer/server/app/schemas/user.py
 
-from pydantic import BaseModel, EmailStr, Field, ConfigDict, BeforeValidator # Import ConfigDict and BeforeValidator
-from typing import Optional, Annotated # Import Annotated
+from pydantic import BaseModel, Field, EmailStr, field_validator, ConfigDict # Import v2 components
+from typing import List, Optional, Literal, Any
 from datetime import datetime
-from app.models.user import UserRole # Import UserRole from the models
-from bson import ObjectId # Import ObjectId
+from bson import ObjectId
 
-# --- Helper function for ObjectId to string conversion ---
-# This function will run before Pydantic tries to validate the 'id' field as a string.
-def object_id_to_str(v):
-    if isinstance(v, ObjectId):
-        return str(v)
-    # If it's already a string (e.g., from request body), pass it through
-    if isinstance(v, str):
-        return v
-    # Raise error for other unexpected types
-    raise ValueError(f"Expected ObjectId or str, received {type(v)}")
+# Define allowed user roles using Literal for better type safety
+UserRole = Literal["candidate", "hr", "admin"]
 
-# --- Custom type using Annotated and BeforeValidator ---
-# This tells Pydantic to run object_id_to_str on the input before validating it as a string.
-PyObjectIdStr = Annotated[str, BeforeValidator(object_id_to_str)]
+# --- Custom ObjectId Handling ---
+# Reusable type for handling ObjectId validation and serialization
+# Pydantic v2 has better built-in support for types like this.
+class PyObjectIdStr(str):
+    @classmethod
+    def __get_validators__(cls):
+        yield cls.validate
 
-# --- Base User Schema ---
-class UserBase(BaseModel):
+    @classmethod
+    def validate(cls, v: Any, _info) -> str: # Changed handler signature for v2
+        if isinstance(v, ObjectId):
+            return str(v)
+        if isinstance(v, str) and ObjectId.is_valid(v):
+            # Optionally convert back to ObjectId internally if needed, but return str
+            # return ObjectId(v) # No, return str for API consistency
+            return v
+        raise ValueError(f"Not a valid ObjectId string: {v}")
+
+    # Pydantic v2 uses __get_pydantic_core_schema__ for deeper integration
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source_type: Any, handler: Any) -> Any:
+        from pydantic_core import core_schema
+        return core_schema.with_info_plain_validator_function(
+            cls.validate, # Use the same validation logic
+             serialization=core_schema.to_string_ser_schema(), # Ensure serialization to string
+        )
+
+# --- Base Schemas ---
+class BaseUser(BaseModel):
+    # Use v2 model_config instead of Config class
+    model_config = ConfigDict(
+        populate_by_name=True, # Keep aliasing enabled
+        arbitrary_types_allowed=True # Allow types like ObjectId if used internally before validation
+    )
+
     username: str = Field(..., min_length=3, max_length=50)
     email: EmailStr
+    role: UserRole # Use the Literal type for role
 
-# --- Schema for User Creation ---
-class UserCreate(UserBase):
-    password: str = Field(..., min_length=8, description="User password")
-    role: UserRole = Field(..., description="User role (admin, hr, or candidate)")
+    # V2 Field Validator for 'role'
+    @field_validator('role', mode='before')
+    @classmethod
+    def check_role(cls, value: str) -> str:
+        allowed_roles = list(UserRole.__args__) # Get allowed roles from Literal
+        if value not in allowed_roles:
+            raise ValueError(f"Invalid role '{value}'. Must be one of: {', '.join(allowed_roles)}")
+        return value
 
-    model_config = ConfigDict( # Use model_config in Pydantic v2
-        json_schema_extra = {
-            "example": {
-                "username": "newcandidate",
-                "email": "candidate@example.com",
-                "password": "strongpassword123",
-                "role": "candidate"
-            }
-        }
-    )
+# Schema for user creation (includes password)
+class UserCreate(BaseUser):
+    password: str = Field(..., min_length=8)
 
-# --- Schema for User Output (General API Responses) ---
-class UserOut(UserBase):
-    # Use the custom type PyObjectIdStr for the id field
-    id: PyObjectIdStr = Field(alias="_id", description="User's unique ID")
-    role: UserRole
-    created_at: datetime
-    resume_path: Optional[str] = None
+# Schema for user update (optional fields)
+class UserUpdate(BaseModel):
+    username: Optional[str] = Field(None, min_length=3, max_length=50)
+    email: Optional[EmailStr] = None
+    # Role update might require specific logic/permissions, handle in route if needed
+    # role: Optional[UserRole] = None
+    password: Optional[str] = Field(None, min_length=8) # Optional password update
 
-    model_config = ConfigDict( # Use model_config in Pydantic v2
-        from_attributes = True, # Keep ORM mode enabled if needed elsewhere
-        populate_by_name = True # Allow populating by field name OR alias ('_id')
-        # arbitrary_types_allowed=True # Not strictly needed if using BeforeValidator explicitly
-    )
-    # Removed json_schema_extra from UserOut as the example ID might confuse if not str
+# Schema for user output (excludes password, includes ID)
+class UserOut(BaseUser):
+    id: PyObjectIdStr = Field(..., alias="_id") # Use alias for MongoDB _id field
+    created_at: Optional[datetime] = None
+    resume_path: Optional[str] = None # Keep these optional output fields
 
-# --- Schema specifically for Admin User List Response ---
-# Inherits from UserOut, so it gets the corrected id handling
-class UserResponse(UserOut):
-    pass
+# Schema for representing user data in responses (can wrap UserOut)
+class UserResponse(BaseModel):
+    message: str
+    user: Optional[UserOut] = None
+    users: Optional[List[UserOut]] = None # For returning lists of users
 
-# --- Schema for Token Response (Login/Register) ---
+# --- Token Schemas ---
 class Token(BaseModel):
     access_token: str
-    token_type: str = "bearer"
+    token_type: str
 
-# --- Schema for Data inside JWT Token ---
 class TokenData(BaseModel):
-    email: Optional[str] = None
+    # Store email (subject) and potentially role from token payload
+    email: Optional[EmailStr] = None
     role: Optional[UserRole] = None
-    # id: Optional[str] = None # ID is usually looked up via email (sub)

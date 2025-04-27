@@ -5,17 +5,26 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 import io
 
-# Import necessary parsing libraries (ensure they are in requirements.txt)
+# --- MODIFIED: Import PdfReader from pypdf ---
 try:
-    import PyPDF2
+    # Use the correct library name from requirements.txt
+    from pypdf import PdfReader
+    from pypdf.errors import PdfReadError # Import specific error if needed
+    PYPDF_AVAILABLE = True
 except ImportError:
-    PyPDF2 = None
-    logging.warning("pypdf2 library not found. PDF parsing will be unavailable.")
+    PdfReader = None
+    PdfReadError = None # Define as None if import fails
+    PYPDF_AVAILABLE = False
+    # Updated warning message
+    logging.warning("pypdf library not found. PDF parsing will be unavailable.")
+# --- END MODIFIED IMPORT ---
 
 try:
     import docx # python-docx library
+    DOCX_AVAILABLE = True
 except ImportError:
     docx = None
+    DOCX_AVAILABLE = False
     logging.warning("python-docx library not found. DOCX parsing will be unavailable.")
 
 # Configure logging
@@ -50,23 +59,24 @@ async def parse_resume(file_path: Path) -> Optional[str]:
 
     try:
         if file_extension == ".pdf":
-            if not PyPDF2:
-                logger.error("Cannot parse PDF: pypdf2 library is not installed.")
-                raise ResumeParserError("PDF parsing library (pypdf2) not available.")
-            return await _parse_pdf(file_path)
+            # --- MODIFIED: Check for PYPDF_AVAILABLE ---
+            if not PYPDF_AVAILABLE:
+                logger.error("Cannot parse PDF: pypdf library is not installed.")
+                # Updated error message
+                raise ResumeParserError("PDF parsing library (pypdf) not available.")
+            # --- END MODIFIED CHECK ---
+            return await _parse_pdf(file_path) # Call updated function
         elif file_extension == ".docx":
-            if not docx:
+            if not DOCX_AVAILABLE:
                 logger.error("Cannot parse DOCX: python-docx library is not installed.")
                 raise ResumeParserError("DOCX parsing library (python-docx) not available.")
-            return await _parse_docx(file_path)
+            return await _parse_docx(file_path) # No changes needed here
         elif file_extension == ".doc":
-            # Handling .doc is complex and often requires external tools like antiword or LibreOffice.
-            # It's generally recommended to ask users to upload PDF or DOCX.
             logger.warning(f"Parsing '.doc' files is not directly supported. File: {file_path}")
-            return None # Or raise ResumeParserError("Unsupported file type: .doc")
+            return None
         else:
             logger.warning(f"Unsupported resume file type: {file_extension}. File: {file_path}")
-            return None # Or raise ResumeParserError(f"Unsupported file type: {file_extension}")
+            return None
 
     except FileNotFoundError: # Should be caught above, but as safety
         raise
@@ -76,30 +86,36 @@ async def parse_resume(file_path: Path) -> Optional[str]:
         logger.error(f"An unexpected error occurred during parsing of {file_path}: {e}", exc_info=True)
         raise ResumeParserError(f"Failed to parse resume file {file_path.name} due to an unexpected error.") from e
 
-
+# --- FUNCTION MODIFIED TO USE pypdf ---
 async def _parse_pdf(file_path: Path) -> Optional[str]:
-    """Helper function to parse PDF files using PyPDF2."""
+    """Helper function to parse PDF files using pypdf."""
     text_content = ""
     try:
-        with file_path.open("rb") as pdf_file:
-            reader = PyPDF2.PdfReader(pdf_file)
-            num_pages = len(reader.pages)
-            logger.info(f"Parsing PDF file '{file_path.name}' with {num_pages} pages.")
-            for page_num in range(num_pages):
-                page = reader.pages[page_num]
-                text_content += page.extract_text() or "" # Add extracted text, handle None
-        logger.info(f"Successfully extracted text from PDF: {file_path.name}")
+        # pypdf uses PdfReader directly with the file path or a stream
+        reader = PdfReader(file_path)
+        num_pages = len(reader.pages)
+        logger.info(f"Parsing PDF file '{file_path.name}' with {num_pages} pages using pypdf.")
+        for page in reader.pages:
+            # Concatenate text from each page
+            extracted = page.extract_text()
+            if extracted:
+                text_content += extracted + "\n" # Add newline between pages
+
+        logger.info(f"Successfully extracted text from PDF using pypdf: {file_path.name}")
         return text_content.strip() if text_content else None
-    except PyPDF2.errors.PdfReadError as e:
-        logger.error(f"PyPDF2 error reading PDF {file_path.name}: {e}")
-        raise ResumeParserError(f"Invalid or corrupted PDF file: {file_path.name}") from e
-    except Exception as e:
-        logger.error(f"Error parsing PDF {file_path.name}: {e}", exc_info=True)
-        raise ResumeParserError(f"Failed to parse PDF {file_path.name}") from e
+    # Catch pypdf specific errors if available, or general exceptions
+    except PdfReadError as e: # Catch specific pypdf error
+        logger.error(f"pypdf error reading PDF {file_path.name}: {e}")
+        raise ResumeParserError(f"Invalid or corrupted PDF file (pypdf): {file_path.name}") from e
+    except Exception as e: # Catch other unexpected errors
+        logger.error(f"Error parsing PDF {file_path.name} with pypdf: {e}", exc_info=True)
+        raise ResumeParserError(f"Failed to parse PDF {file_path.name} using pypdf") from e
+# --- END FUNCTION MODIFICATION ---
 
 
 async def _parse_docx(file_path: Path) -> Optional[str]:
     """Helper function to parse DOCX files using python-docx."""
+    # This function remains the same as it uses python-docx
     try:
         document = docx.Document(file_path)
         logger.info(f"Parsing DOCX file: {file_path.name}")
@@ -108,13 +124,5 @@ async def _parse_docx(file_path: Path) -> Optional[str]:
         logger.info(f"Successfully extracted text from DOCX: {file_path.name}")
         return content.strip() if content else None
     except Exception as e:
-        # python-docx can raise various errors (e.g., PackageNotFoundError for corrupted files)
         logger.error(f"Error parsing DOCX {file_path.name}: {e}", exc_info=True)
         raise ResumeParserError(f"Failed to parse DOCX file {file_path.name}. It might be corrupted or not a valid DOCX.") from e
-
-# --- Potential Future Enhancements ---
-# async def extract_entities(text: str) -> Dict[str, Any]:
-#     """Placeholder for extracting structured data (skills, experience years, etc.) using NLP/LLM."""
-#     logger.info("Extracting entities from resume text (Placeholder)...")
-#     # Add NLP logic here (e.g., using spaCy, NLTK, or another LLM call)
-#     return {"skills": [], "experience_years": None, "summary": text[:500]} # Example placeholder

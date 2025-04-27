@@ -1,15 +1,21 @@
-# Include core requirements
+# LLM_interviewer/server/requirements-dev.txt
+
+# Include production dependencies
 -r requirements.txt
 
-# Testing
-pytest==8.0.0
-pytest-asyncio==0.21.1
-httpx==0.26.0
-pytest-cov==4.1.0
+# --- Testing ---
+pytest>=7.0.0,<9.0.0  # Testing framework
+pytest-asyncio>=0.20.0,<0.24.0 # For async tests with pytest
+asgi-lifespan>=2.0,<3.0
+# --- HTTP Client for Testing ---
+httpx>=0.24.0,<0.28.0 # Async HTTP client, often used by FastAPI's TestClient
 
-# Development Tools
-black==24.3.0
-ruff==0.3.5 
-coverage>=7.0.0
-flake8>=7.0.0
+# --- Optional: Linting/Formatting ---
+# flake8>=6.0.0,<8.0.0
+# black>=23.0.0,<25.0.0
+# isort>=5.0.0,<6.0.0
+# mypy>=1.0.0,<2.0.0
 
+# --- Optional: Debugging ---
+# ipython>=8.0.0,<9.0.0
+# ipdb>=0.13.0,<0.14.0

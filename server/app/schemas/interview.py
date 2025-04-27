@@ -1,175 +1,207 @@
 # LLM_interviewer/server/app/schemas/interview.py
 
+from pydantic import BaseModel, Field, field_validator, ConfigDict # Import v2 components
+from typing import List, Optional, Dict, Any
 from datetime import datetime
-from typing import List, Optional
-from pydantic import BaseModel, Field, constr # Added constr
-# from uuid import uuid4 # Not used here
-from app.core.config import settings # Import settings for validation values
+from bson import ObjectId
+import uuid # Added import for uuid (needed for default factory if used)
 
+# Import the custom ObjectId type handler from user schemas
+# Ensure this path is correct relative to your project structure
+from .user import PyObjectIdStr
+
+# --- Base Question Schema ---
 class QuestionBase(BaseModel):
-    text: str
-    # Make category/difficulty optional as they might not always come from Gemini/Defaults
-    category: Optional[str] = None
-    difficulty: Optional[str] = None
+    text: str = Field(..., description="The text of the interview question")
+    category: str = Field(..., description="Category of the question (e.g., Behavioral, Technical)")
+    difficulty: str = Field(..., description="Difficulty level (e.g., Easy, Medium, Hard)")
+    # Added question_id here as it's used in the embedded doc and mock data
+    question_id: Optional[str] = Field(None, description="Custom identifier for the question")
 
+# Schema for creating a question (inherits from Base)
+# This might be used if questions were managed in a separate collection
 class QuestionCreate(QuestionBase):
     pass
 
-class QuestionOut(QuestionBase):
-    question_id: str # Should be populated when creating/retrieving
-    created_at: Optional[datetime] = None # Make optional
+# Schema for Question output FROM THE QUESTIONS COLLECTION (includes DB _id)
+class Question(QuestionBase):
+    id: PyObjectIdStr = Field(..., alias="_id")
+    # question_id: Optional[str] = Field(None, description="Optional custom identifier for the question") # Already in Base
+    created_at: datetime
 
-    class Config:
-        from_attributes = True # Use from_attributes for Pydantic v2
+    # Use v2 model_config
+    model_config = ConfigDict(
+        populate_by_name=True,
+        arbitrary_types_allowed=True
+    )
 
+# Output schema for individual questions (if fetched directly)
+class QuestionOut(Question): # Often Question itself is sufficient for output
+    pass
+
+# --- Base Interview Schema ---
 class InterviewBase(BaseModel):
-    candidate_id: str # Candidate's DB ID (_id as string)
-    scheduled_time: datetime
-    role: str # Added in previous steps
-    tech_stack: List[str] # Added in previous steps
+    candidate_id: PyObjectIdStr = Field(..., description="ID of the candidate")
+    hr_id: PyObjectIdStr = Field(..., description="ID of the HR personnel who scheduled")
+    job_title: str = Field(..., description="Job title for the interview")
+    job_description: Optional[str] = Field(None, description="Job description")
+    scheduled_time: Optional[datetime] = Field(None, description="Time the interview is scheduled for")
+    status: str = Field("Scheduled", description="Status (e.g., Scheduled, In Progress, Completed, Evaluated)")
 
-class InterviewCreate(InterviewBase):
-     # Inherits fields from InterviewBase
-     class Config:
-        json_schema_extra = {
-            "example": {
-                "candidate_id": "60d5ecf1b3f8f5a9f3e8e1c1",
-                "scheduled_time": "2024-08-15T14:30:00Z",
-                "role": "Backend Developer",
-                "tech_stack": ["Python", "FastAPI", "Docker", "MongoDB"]
-            }
-        }
+# Schema for creating an interview (Payload for POST /interview/schedule)
+class InterviewCreate(BaseModel):
+    candidate_id: PyObjectIdStr
+    # hr_id: PyObjectIdStr # REMOVED - Determined server-side from token
+    job_title: str
+    job_description: Optional[str] = None
+    scheduled_time: Optional[datetime] = None
+    role: str = Field(..., description="Role being interviewed for (e.g., Software Engineer)")
+    tech_stack: List[str] = Field(default_factory=list, description="Relevant technical skills/stack")
 
-class InterviewOut(InterviewBase):
-    # Use DB _id as the primary ID for the interview document
-    id: str = Field(alias="_id")
-    interview_id: str # Keep separate generated ID if used for sharing/URLs
-    hr_id: str # HR user's DB ID (_id as string)
-    status: str
-    questions: List[QuestionOut]
+# Schema representing the Interview document IN THE DATABASE
+class Interview(InterviewBase):
+    id: PyObjectIdStr = Field(..., alias="_id")
+    interview_id: str = Field(..., description="Custom unique ID for the interview session") # Added this
+    # Embed the generated questions directly
+    questions: List[Dict[str, Any]] = Field(default_factory=list, description="List of generated questions embedded")
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    # Results fields can be added here too if storing directly on the interview doc
+    overall_score: Optional[float] = Field(None, description="Overall score if calculated")
+    overall_feedback: Optional[str] = Field(None, description="Overall feedback if provided")
+    completed_at: Optional[datetime] = None # Added for completion time
+    evaluated_by: Optional[str] = None # Added tracking
+    evaluated_at: Optional[datetime] = None # Added tracking
+
+
+    # Use v2 model_config
+    model_config = ConfigDict(
+        populate_by_name=True,
+        arbitrary_types_allowed=True,
+        json_encoders={ObjectId: str} # Ensure ObjectId is serialized correctly
+    )
+
+# Schema for Interview Output (API Response for GET /interview/{id})
+class InterviewOut(InterviewBase): # Inherit from Base, add fields needed for output
+    id: PyObjectIdStr = Field(..., alias="_id") # MongoDB ObjectId
+    interview_id: Optional[str] = Field(None, description="Custom interview identifier generated during creation")
+    # Return the embedded questions using QuestionBase which doesn't require _id
+    questions: Optional[List[QuestionBase]] = None
     created_at: Optional[datetime] = None
-    completed_at: Optional[datetime] = None
-    # Overall results stored on the interview document
-    overall_score: Optional[float] = None
+    updated_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None # Include completion time
+    overall_score: Optional[float] = None # Include results if available
     overall_feedback: Optional[str] = None
-    evaluated_by: Optional[str] = None # Username of evaluator
-    evaluated_at: Optional[datetime] = None # Timestamp of evaluation
+    evaluated_by: Optional[str] = None # Include evaluator info
+    evaluated_at: Optional[datetime] = None # Include evaluation time
 
-    class Config:
-        from_attributes = True
-        populate_by_name = True # Allow population by field name or alias (_id)
+    # Use v2 config style for consistency
+    model_config = ConfigDict(
+        from_attributes = True, # Renamed from orm_mode
+        populate_by_name=True,
+        arbitrary_types_allowed=True,
+        json_encoders={ObjectId: str, datetime: lambda dt: dt.isoformat() if dt else None} # Handle datetime too
+    )
 
+
+# --- Interview Response Schemas (Separate Collection Likely) ---
+# Schema for the structure of submitted answers in SubmitAnswersRequest
+class AnswerItem(BaseModel):
+    question_id: str
+    answer_text: str
+
+    model_config = ConfigDict(
+         json_schema_extra={
+             "example": {"question_id": "q1_uuid", "answer_text": "My answer..."}
+        }
+    )
+
+# Request body for submitting all answers
+class SubmitAnswersRequest(BaseModel):
+    interview_id: str # Use custom interview_id
+    answers: List[AnswerItem] # Use the specific AnswerItem schema
+
+# Base for response data stored in DB
 class InterviewResponseBase(BaseModel):
     interview_id: str
     question_id: str
-    answer: str
-
-class InterviewResponseCreate(InterviewResponseBase):
-    pass
-
-class InterviewResponseOut(InterviewResponseBase):
-    # Use response's own DB ID
-    response_id: str = Field(alias="_id")
-    candidate_id: str # Candidate's DB ID
-    # Score/Feedback for this specific response
-    score: Optional[float] = None
-    feedback: Optional[str] = None
+    candidate_id: PyObjectIdStr
+    answer: str # Renamed from answer_text for consistency with DB field in route
     submitted_at: datetime
-    # Track evaluation specific to this response (e.g., by AI trigger)
-    evaluated_by: Optional[str] = None
-    evaluated_at: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
-        populate_by_name = True # Allow population by field name or alias (_id)
+# Schema for creating a single response (not typically used if using submit-all)
+class InterviewResponseCreate(InterviewResponseBase):
+     pass # Inherits fields needed for creation
 
-# --- NEW Schema for submitting score/feedback PER RESPONSE ---
-class ResponseFeedbackCreate(BaseModel):
-    question_id: str = Field(..., description="The ID of the question being evaluated")
-    # Use settings for score validation range
-    score: Optional[float] = Field(
-        None,
-        ge=settings.EVALUATION_SCORE_MIN, # Use setting
-        le=settings.EVALUATION_SCORE_MAX, # Use setting
-        description=f"Score for this answer ({settings.EVALUATION_SCORE_MIN}-{settings.EVALUATION_SCORE_MAX} scale)"
-    )
-    feedback: Optional[constr(strip_whitespace=True, max_length=1000)] = Field( # Add length limit
-        None,
-        description="Feedback specific to this answer (max 1000 chars)"
+# Schema representing the Response document IN THE DATABASE
+class InterviewResponse(InterviewResponseBase):
+    id: PyObjectIdStr = Field(..., alias="_id")
+    score: Optional[float] = Field(None, description="Score assigned by LLM or HR")
+    feedback: Optional[str] = Field(None, description="Feedback provided during evaluation")
+    evaluated_by: Optional[str] = None # Added tracking
+    evaluated_at: Optional[datetime] = None # Added tracking
+
+    model_config = ConfigDict(
+        populate_by_name=True,
+        arbitrary_types_allowed=True,
+        json_encoders={ObjectId: str, datetime: lambda dt: dt.isoformat() if dt else None}
     )
 
-    class Config:
-         json_schema_extra = {
-            "example": {
-                "question_id": "q_uuid_or_db_id_1",
-                "score": 4.0,
-                "feedback": "Good explanation, could provide more specific examples."
-            }
-        }
-# --- End NEW Schema ---
+# Schema for Response Output (API Response)
+class InterviewResponseOut(InterviewResponse):
+    # Rename 'id' field to 'response_id' for clarity in output if desired
+    # response_id: PyObjectIdStr = Field(..., alias="_id")
+    # id: Optional[Any] = Field(None, exclude=True) # Exclude the original 'id' if renaming
+    pass # Currently inherits all fields including 'id' aliased from '_id'
 
-class SubmitAnswersRequest(BaseModel):
-    """Schema for submitting all answers for an interview at once."""
-    interview_id: str
-    responses: List[InterviewResponseCreate] # Uses the existing schema for individual responses
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "interview_id": "some_interview_uuid_or_db_id",
-                "responses": [
-                    {"question_id": "q_id_1", "answer": "My answer to question 1."},
-                    {"question_id": "q_id_2", "answer": "My answer to question 2."}
-                ]
-            }
+# --- Schemas for Specific API Endpoints ---
+
+# Schema for individual feedback item within InterviewResultSubmit
+class ResponseFeedbackItem(BaseModel):
+    question_id: str
+    score: Optional[float] = Field(None, ge=0, le=5)
+    feedback: Optional[str] = None
+
+    # Optional: Add config if needed
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {"question_id": "q1_uuid", "score": 4.0, "feedback": "Good answer."}
         }
-# --- RENAMED/MODIFIED Schema for Submitting All Results/Feedback ---
+    )
+
+# Schema for submitting evaluation results (potentially by HR or automated process)
 class InterviewResultSubmit(BaseModel):
-    # Payload for POST /interview/{id}/results endpoint
+    # interview_id: str # REMOVED - comes from path parameter
+    overall_score: Optional[float] = Field(None, ge=0, le=5) # Optional overall score
+    overall_feedback: Optional[str] = None
+    # Added responses_feedback based on route logic usage:
+    responses_feedback: Optional[List[ResponseFeedbackItem]] = Field(None, description="Optional list of feedback per response")
+    status: Optional[str] = Field(None, description="e.g., Evaluated") # Optional status update
 
-    # List of feedback items for individual responses (Optional)
-    responses_feedback: Optional[List[ResponseFeedbackCreate]] = Field(
-        None,
-        description="Feedback and scores for individual responses"
-    )
-
-    # Overall assessment (Optional)
-    # Use settings for score validation range
-    overall_score: Optional[float] = Field(
-        None,
-        ge=settings.EVALUATION_SCORE_MIN, # Use setting
-        le=settings.EVALUATION_SCORE_MAX, # Use setting
-        description=f"Overall score ({settings.EVALUATION_SCORE_MIN}-{settings.EVALUATION_SCORE_MAX} scale, optional override)"
-    )
-    overall_feedback: Optional[constr(strip_whitespace=True, max_length=5000)] = Field( # Add length limit
-        None,
-        description="Overall feedback summary (max 5000 chars, optional)"
-    )
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "responses_feedback": [
-                    {"question_id": "q_id_1", "score": 4.5, "feedback": "Very clear."},
-                    {"question_id": "q_id_2", "score": 3.0, "feedback": "Confusing."},
-                    {"question_id": "q_id_3", "score": None, "feedback": "Skipped."} # Example without score
-                ],
-                "overall_score": 3.8, # Can be calculated or manually entered
-                "overall_feedback": "Overall good technical understanding, communication needs work."
-            }
+    # Example config
+    model_config = ConfigDict(
+         json_schema_extra={
+             "example": {
+                 "responses_feedback": [{"question_id": "q1_id", "score": 4.0, "feedback": "Good"}],
+                 "overall_score": 4.0,
+                 "overall_feedback": "Overall good."
+             }
         }
-# --- End RENAMED/MODIFIED Schema ---
+    )
 
 
-# Existing InterviewResultOut - Represents data returned by GET /results/{id}
-# May need adjustment based on how results are calculated/stored.
+# Schema for returning interview results summary (used by GET /results/{id})
 class InterviewResultOut(BaseModel):
-    result_id: str # Usually f"result_{interview_id}"
+    result_id: str # e.g., "result_INTERVIEW_ID"
     interview_id: str
-    candidate_id: str
-    total_score: Optional[float] = None # Make optional as it might be pending
-    overall_feedback: Optional[str] = None # Get from Interview doc
+    candidate_id: PyObjectIdStr
+    total_score: Optional[float] = None # Final score (manual or calculated)
+    overall_feedback: Optional[str] = None
     completed_at: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(
+        populate_by_name=True, # Allow mapping from DB fields if needed
+        arbitrary_types_allowed=True,
+        json_encoders={ObjectId: str, datetime: lambda dt: dt.isoformat() if dt else None}
+    )
