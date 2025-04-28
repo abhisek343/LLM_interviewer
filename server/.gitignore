@@ -53,3 +53,5 @@ Readme.md
 # Ignore pytest cache
 .pytest_cache/
 pyvenv.cfg
+
+.venv/Scripts
