@@ -104,11 +104,30 @@ class InterviewOut(InterviewBase): # Inherit from Base, add fields needed for ou
     )
 
 
-# --- Interview Response Schemas (Separate Collection Likely) ---
-# Schema for the structure of submitted answers in SubmitAnswersRequest
+# --- Interview Response Schemas ---
+
+# === NEW Schema for submitting a SINGLE response ===
+class SingleResponseSubmit(BaseModel):
+    """Schema for the request body when submitting a single answer."""
+    interview_id: str = Field(..., description="The custom ID of the interview session")
+    question_id: str = Field(..., description="The ID of the question being answered")
+    answer: str = Field(..., min_length=1, description="The candidate's answer text") # Use 'answer' to match endpoint logic
+
+    model_config = ConfigDict(
+         json_schema_extra={
+             "example": {
+                 "interview_id": "some_interview_uuid",
+                 "question_id": "some_question_uuid",
+                 "answer": "My detailed answer to this specific question."
+            }
+        }
+    )
+# === END NEW Schema ===
+
+# Schema for the structure of submitted answers in SubmitAnswersRequest (for /submit-all)
 class AnswerItem(BaseModel):
     question_id: str
-    answer_text: str
+    answer_text: str # Keep as answer_text for consistency with /submit-all endpoint
 
     model_config = ConfigDict(
          json_schema_extra={
@@ -116,22 +135,19 @@ class AnswerItem(BaseModel):
         }
     )
 
-# Request body for submitting all answers
+# Request body for submitting all answers (/submit-all)
 class SubmitAnswersRequest(BaseModel):
     interview_id: str # Use custom interview_id
     answers: List[AnswerItem] # Use the specific AnswerItem schema
 
-# Base for response data stored in DB
+
+# Base for response data stored in DB (used by InterviewResponse)
 class InterviewResponseBase(BaseModel):
     interview_id: str
     question_id: str
     candidate_id: PyObjectIdStr
     answer: str # Renamed from answer_text for consistency with DB field in route
     submitted_at: datetime
-
-# Schema for creating a single response (not typically used if using submit-all)
-class InterviewResponseCreate(InterviewResponseBase):
-     pass # Inherits fields needed for creation
 
 # Schema representing the Response document IN THE DATABASE
 class InterviewResponse(InterviewResponseBase):
@@ -147,12 +163,10 @@ class InterviewResponse(InterviewResponseBase):
         json_encoders={ObjectId: str, datetime: lambda dt: dt.isoformat() if dt else None}
     )
 
-# Schema for Response Output (API Response)
+# Schema for Response Output (API Response for GET /responses and POST /submit-response)
 class InterviewResponseOut(InterviewResponse):
-    # Rename 'id' field to 'response_id' for clarity in output if desired
-    # response_id: PyObjectIdStr = Field(..., alias="_id")
-    # id: Optional[Any] = Field(None, exclude=True) # Exclude the original 'id' if renaming
-    pass # Currently inherits all fields including 'id' aliased from '_id'
+    # Inherits all fields including 'id' aliased from '_id'
+    pass
 
 
 # --- Schemas for Specific API Endpoints ---
@@ -163,23 +177,20 @@ class ResponseFeedbackItem(BaseModel):
     score: Optional[float] = Field(None, ge=0, le=5)
     feedback: Optional[str] = None
 
-    # Optional: Add config if needed
     model_config = ConfigDict(
         json_schema_extra={
             "example": {"question_id": "q1_uuid", "score": 4.0, "feedback": "Good answer."}
         }
     )
 
-# Schema for submitting evaluation results (potentially by HR or automated process)
+# Schema for submitting evaluation results (POST /{interview_id}/results)
 class InterviewResultSubmit(BaseModel):
     # interview_id: str # REMOVED - comes from path parameter
     overall_score: Optional[float] = Field(None, ge=0, le=5) # Optional overall score
     overall_feedback: Optional[str] = None
-    # Added responses_feedback based on route logic usage:
     responses_feedback: Optional[List[ResponseFeedbackItem]] = Field(None, description="Optional list of feedback per response")
     status: Optional[str] = Field(None, description="e.g., Evaluated") # Optional status update
 
-    # Example config
     model_config = ConfigDict(
          json_schema_extra={
              "example": {
