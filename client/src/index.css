@@ -1,0 +1,8 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom scrollbar or overrides (optional) */
+body {
+  font-family: 'Inter', sans-serif;
+}
